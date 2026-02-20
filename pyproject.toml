@@ -1,0 +1,29 @@
+[project]
+name = "venturi"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "auraloss>=0.4.0",
+    "black>=26.1.0",
+    "equinox>=0.13.4",
+    "jax>=0.9.0.1",
+    "jaxtyping>=0.3.9",
+    "jsonargparse[signatures]>=4.46.0",
+    "korvax>=0.3.0",
+    "librosa>=0.11.0",
+    "lightning>=2.6.1",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.2",
+    "optax>=0.2.7",
+    "pandas>=3.0.1",
+    "pip-chill>=1.0.3",
+    "scipy>=1.17.0",
+    "tensorboard>=2.20.0",
+    "torch>=2.10.0",
+    "torchaudio>=2.10.0",
+    "torchcodec>=0.10.0",
+    "torchvision>=0.25.0",
+    "wandb>=0.25.0",
+]
