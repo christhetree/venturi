@@ -1,0 +1,4 @@
+[submodule "pytorch-hessian-eigenthings"]
+	path = pytorch-hessian-eigenthings
+	url = https://github.com/christhetree/pytorch-hessian-eigenthings.git
+	branch = master
