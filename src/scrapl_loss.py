@@ -442,14 +442,12 @@ if __name__ == "__main__":
     n_batches = 1
 
     enc_key, dec_key, data_key = jax.random.split(master_key, 3)
+    batched_inference_fn_jax = eqx.filter_jit(
+        jax.vmap(lambda model, x: model(x), in_axes=(None, 0))
+    )
+
     # Encoder ==========================================================================
     encoder_jax = EncoderJAX(n_samples, n_theta, key=enc_key)
-
-
-    @eqx.filter_jit
-    def theta_fn_jax(x):
-        return encoder_jax(x)
-
 
     encoder_torch = nn.Sequential(
         nn.Linear(n_samples, n_theta),
@@ -458,10 +456,9 @@ if __name__ == "__main__":
         nn.Sigmoid(),
     )
     load_jax_to_pytorch(encoder_jax, encoder_torch)
-    theta_fn_torch = lambda x: encoder_torch(x)
 
     x_jax = jax.random.uniform(data_key, (bs, n_samples))
-    theta_hat_jax = jax.vmap(theta_fn_jax)(x_jax)
+    theta_hat_jax = batched_inference_fn_jax(encoder_jax, x_jax)
 
     x_torch = tr.from_dlpack(x_jax)
     theta_hat_torch = encoder_torch(x_torch)
@@ -473,12 +470,6 @@ if __name__ == "__main__":
     # Decoder ==========================================================================
     decoder_jax = DecoderJAX(n_theta, n_samples, key=dec_key)
 
-
-    @eqx.filter_jit
-    def synth_fn_jax(theta):
-        return decoder_jax(theta)
-
-
     decoder_torch = nn.Sequential(
         nn.Linear(n_theta, n_theta),
         nn.PReLU(),
@@ -486,22 +477,17 @@ if __name__ == "__main__":
         nn.Tanh(),
     )
     load_jax_to_pytorch(decoder_jax, decoder_torch)
-    synth_fn_torch = lambda theta: decoder_torch(theta)
 
-    x_hat_jax = jax.vmap(synth_fn_jax)(theta_hat_jax)
+    x_hat_jax = batched_inference_fn_jax(decoder_jax, theta_hat_jax)
     x_hat_torch = decoder_torch(theta_hat_torch)
 
     x_hat_torch_to_jax = jax.dlpack.from_dlpack(x_hat_torch.detach())
     assert jnp.allclose(x_hat_jax, x_hat_torch_to_jax, atol=1e-7)
-    exit()
+    # exit()
 
-    decoder = nn.Sequential(
-        nn.Linear(n_theta, n_theta),
-        nn.PReLU(),
-        nn.Linear(n_theta, n_samples),
-        nn.Tanh(),
-    )
-    synth_fn = lambda theta: decoder(theta)
+    # Test warmup_lc_hvp ===============================================================
+    theta_fn = lambda x: encoder_torch(x)
+    synth_fn = lambda theta: decoder_torch(theta)
 
     theta_is_batches = [tr.rand((bs, n_samples)) for _ in range(n_batches)]
     theta_fn_kwargs = [{"x": batch} for batch in theta_is_batches]
