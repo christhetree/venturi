@@ -3,8 +3,12 @@ import logging
 import os
 from typing import Optional, List, Dict, Any, Callable, Literal
 
+import equinox as eqx
+import jax
+import jax.numpy as jnp
 import torch as tr
-from torch import Tensor as T
+from jaxtyping import Array, Float
+from torch import Tensor as T, nn
 from torch.nn import Parameter
 
 import hessian_eigenthings
@@ -373,3 +377,147 @@ def warmup_lc_hvp(
     vals = tr.stack(vals, dim=0)
     vals = _aggregate_vals(vals, n_theta, agg=agg)
     return vals
+
+
+@tr.no_grad()
+def load_jax_to_pytorch(jax_model: eqx.Module, torch_model: nn.Module) -> None:
+    # Map JAX layers to PyTorch layers
+    # JAX layers[0] -> torch_model[0]
+    # JAX layers[2] -> torch_model[2]
+
+    # Layer 1
+    torch_model[0].weight.copy_(tr.from_dlpack(jax_model.layers[0].weight))
+    torch_model[0].bias.copy_(tr.from_dlpack(jax_model.layers[0].bias))
+
+    # Layer 2
+    torch_model[2].weight.copy_(tr.from_dlpack(jax_model.layers[2].weight))
+    torch_model[2].bias.copy_(tr.from_dlpack(jax_model.layers[2].bias))
+
+
+class EncoderJAX(eqx.Module):
+    layers: list
+
+    def __init__(self, n_samples: int, n_theta: int, key: Array):
+        key1, key2 = jax.random.split(key)
+        self.layers = [
+            eqx.nn.Linear(n_samples, n_theta, key=key1),
+            eqx.nn.PReLU(),
+            eqx.nn.Linear(n_theta, n_theta, key=key2),
+            jax.nn.sigmoid,
+        ]
+
+    def __call__(self, x: Float[Array, "n_samples"]) -> Float[Array, "n_theta"]:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class DecoderJAX(eqx.Module):
+    layers: list
+
+    def __init__(self, n_theta: int, n_samples: int, key: Array):
+        key1, key2 = jax.random.split(key)
+        self.layers = [
+            eqx.nn.Linear(n_theta, n_theta, key=key1),
+            eqx.nn.PReLU(),
+            eqx.nn.Linear(n_theta, n_samples, key=key2),
+            jax.nn.tanh,
+        ]
+
+    def __call__(self, theta: Float[Array, "n_theta"]) -> Float[Array, "n_samples"]:
+        x = theta
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+if __name__ == "__main__":
+    tr.set_printoptions(precision=4, sci_mode=False)
+    seed = 42
+    master_key = jax.random.PRNGKey(seed)
+    tr.manual_seed(seed)
+    bs = 4
+    n_samples = 8096
+    n_theta = 3
+    n_batches = 1
+
+    enc_key, dec_key, data_key = jax.random.split(master_key, 3)
+    # Encoder ==========================================================================
+    encoder_jax = EncoderJAX(n_samples, n_theta, key=enc_key)
+
+
+    @eqx.filter_jit
+    def theta_fn_jax(x):
+        return encoder_jax(x)
+
+
+    encoder_torch = nn.Sequential(
+        nn.Linear(n_samples, n_theta),
+        nn.PReLU(),
+        nn.Linear(n_theta, n_theta),
+        nn.Sigmoid(),
+    )
+    load_jax_to_pytorch(encoder_jax, encoder_torch)
+    theta_fn_torch = lambda x: encoder_torch(x)
+
+    x_jax = jax.random.uniform(data_key, (bs, n_samples))
+    theta_hat_jax = jax.vmap(theta_fn_jax)(x_jax)
+
+    x_torch = tr.from_dlpack(x_jax)
+    theta_hat_torch = encoder_torch(x_torch)
+
+    # Check that the outputs are close by converting pytorch to jax
+    theta_hat_torch_to_jax = jax.dlpack.from_dlpack(theta_hat_torch.detach())
+    assert jnp.allclose(theta_hat_jax, theta_hat_torch_to_jax, atol=1e-7)
+
+    # Decoder ==========================================================================
+    decoder_jax = DecoderJAX(n_theta, n_samples, key=dec_key)
+
+
+    @eqx.filter_jit
+    def synth_fn_jax(theta):
+        return decoder_jax(theta)
+
+
+    decoder_torch = nn.Sequential(
+        nn.Linear(n_theta, n_theta),
+        nn.PReLU(),
+        nn.Linear(n_theta, n_samples),
+        nn.Tanh(),
+    )
+    load_jax_to_pytorch(decoder_jax, decoder_torch)
+    synth_fn_torch = lambda theta: decoder_torch(theta)
+
+    x_hat_jax = jax.vmap(synth_fn_jax)(theta_hat_jax)
+    x_hat_torch = decoder_torch(theta_hat_torch)
+
+    x_hat_torch_to_jax = jax.dlpack.from_dlpack(x_hat_torch.detach())
+    assert jnp.allclose(x_hat_jax, x_hat_torch_to_jax, atol=1e-7)
+    exit()
+
+    decoder = nn.Sequential(
+        nn.Linear(n_theta, n_theta),
+        nn.PReLU(),
+        nn.Linear(n_theta, n_samples),
+        nn.Tanh(),
+    )
+    synth_fn = lambda theta: decoder(theta)
+
+    theta_is_batches = [tr.rand((bs, n_samples)) for _ in range(n_batches)]
+    theta_fn_kwargs = [{"x": batch} for batch in theta_is_batches]
+
+    params = [p for p in encoder_torch.parameters()]
+
+    loss_fn = nn.MSELoss()
+
+    vals = warmup_lc_hvp(
+        theta_fn=theta_fn,
+        synth_fn=synth_fn,
+        loss_fn=loss_fn,
+        theta_fn_kwargs=theta_fn_kwargs,
+        params=params,
+        n_theta=n_theta,
+        n_iter=20,
+        agg="none",
+        force_multibatch=True,
+    )
