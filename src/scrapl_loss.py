@@ -431,6 +431,102 @@ class DecoderJAX(eqx.Module):
         return x
 
 
+@eqx.filter_jit
+def warmup_lc_hvp_jax(
+        encoder: eqx.Module,
+        decoder: eqx.Module,
+        xs: Float[Array, "n_batches bs n_samples"],
+        key: Array,
+        n_theta: int,
+        n_iter: int = 20
+) -> Float[Array, "n_theta"]:
+    # 1. Partition the encoder
+    enc_train, enc_static = eqx.partition(encoder, eqx.is_array)
+
+    # --- HELPER: The PyTorch `create_graph` equivalent ---
+    def get_param_grad(trainable, static, x_batch, theta_idx):
+        # We define a forward pass strictly for the VJP
+        def enc_forward(w):
+            e = eqx.combine(w, static)
+            return jax.vmap(e)(x_batch)
+
+        # 1. Get theta and the VJP function (this tracks the encoder graph)
+        theta, vjp_fn = jax.vjp(enc_forward, trainable)
+
+        # 2. Compute loss gradient w.r.t theta
+        def get_loss(th):
+            x_hat = jax.vmap(decoder)(th)
+            return jnp.mean((x_batch - x_hat) ** 2)
+
+        # NO STOP_GRADIENT HERE! We let JAX track the derivative of the derivative.
+        dL_dtheta = jax.grad(get_loss)(theta)
+
+        # 3. Mask to isolate the specific theta dimension
+        mask = jnp.zeros_like(dL_dtheta).at[:, theta_idx].set(1.0)
+        dL_dtheta_masked = dL_dtheta * mask
+
+        # 4. Propagate the masked gradient back to the parameters
+        param_grad = vjp_fn(dL_dtheta_masked)[0]
+        return param_grad
+
+    # --- HELPER: Hessian Vector Product ---
+    def hvp_i(trainable, static, x_batch, theta_idx, tangent_tree):
+        # By taking the JVP of the ENTIRE get_param_grad function,
+        # JAX perfectly replicates PyTorch's product-rule curvature math.
+        def f(w): return get_param_grad(w, static, x_batch, theta_idx)
+
+        _, hvp_tree = jax.jvp(f, (trainable,), (tangent_tree,))
+        return hvp_tree
+
+    # --- HELPER: Multibatch Summation ---
+    def multibatch_hvp(trainable, static, theta_idx, tangent_tree):
+        # Map the HVP calculation over all batches
+        batch_hvps = jax.vmap(
+            lambda x: hvp_i(trainable, static, x, theta_idx, tangent_tree)
+        )(xs)
+        # Sum the resulting HVPs across the batch axis (axis 0)
+        return jax.tree_util.tree_map(lambda arr: jnp.sum(arr, axis=0), batch_hvps)
+
+    # --- HELPER: PyTree Math for Power Iteration ---
+    def tree_norm(tree):
+        leaves, _ = jax.tree_util.tree_flatten(tree)
+        return jnp.sqrt(sum(jnp.sum(l ** 2) for l in leaves))
+
+    def normalize(tree):
+        norm = tree_norm(tree)
+        return jax.tree_util.tree_map(lambda x: x / (norm + 1e-12), tree)
+
+    def tree_dot(t1, t2):
+        leaves1, _ = jax.tree_util.tree_flatten(t1)
+        leaves2, _ = jax.tree_util.tree_flatten(t2)
+        return sum(jnp.sum(l1 * l2) for l1, l2 in zip(leaves1, leaves2))
+
+    # --- MAIN LOOP: Compute Eigenvalue per Theta ---
+    def get_eig_for_theta(theta_idx):
+        k = jax.random.fold_in(key, theta_idx)
+
+        # Matched PyTorch's torch.rand initialization (Uniform [0, 1))
+        tangent = jax.tree_util.tree_map(
+            lambda p: jax.random.uniform(k, p.shape), enc_train
+        )
+        tangent = normalize(tangent)
+
+        def power_iter_step(i, v):
+            Hv = multibatch_hvp(enc_train, enc_static, theta_idx, v)
+            return normalize(Hv)
+
+        # Standard Power Iteration loop using lax.fori_loop for fast compilation
+        final_tangent = jax.lax.fori_loop(0, n_iter, power_iter_step, tangent)
+
+        # Calculate final Rayleigh quotient: v^T * H * v
+        Hv = multibatch_hvp(enc_train, enc_static, theta_idx, final_tangent)
+        return jnp.abs(tree_dot(final_tangent, Hv))
+
+    # Vectorize the eigenvalue computation over all dimensions of theta!
+    theta_indices = jnp.arange(n_theta)
+    return jax.vmap(get_eig_for_theta)(theta_indices)
+
+
 if __name__ == "__main__":
     tr.set_printoptions(precision=4, sci_mode=False)
     seed = 42
@@ -507,3 +603,24 @@ if __name__ == "__main__":
         agg="none",
         force_multibatch=True,
     )
+
+    # Format the data for JAX: stack the list of tensors into a single array
+    # Shape becomes (n_batches, bs, n_samples)
+    xs_jax = jnp.stack([jnp.array(b.numpy()) for b in theta_is_batches])
+
+    # Generate a dedicated key for the random tangents in power iteration
+    hvp_key = jax.random.fold_in(master_key, 999)
+
+    # with jax.disable_jit():
+    vals_jax = warmup_lc_hvp_jax(
+        encoder=encoder_jax,
+        decoder=decoder_jax,
+        xs=xs_jax,
+        key=hvp_key,
+        n_theta=n_theta,
+        n_iter=20
+    )
+
+    print("\n--- Eigenvalue Comparison ---")
+    print("PyTorch Vals:", vals.detach().numpy())
+    print("JAX Vals:    ", vals_jax)
