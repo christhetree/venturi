@@ -1,13 +1,14 @@
 import functools
 import logging
 import os
-from typing import Optional, List, Dict, Any, Callable, Literal
+from typing import Optional, List, Dict, Any, Callable, Literal, Tuple
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import optax
 import torch as tr
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, PyTree, Int
 from torch import Tensor as T, nn
 from torch.nn import Parameter
 
@@ -21,14 +22,14 @@ log.setLevel(level=os.environ.get("LOGLEVEL", "INFO"))
 
 # Warmup methods ===================================================================
 def _calc_batch_theta_param_grad(
-        theta_fn: Callable[..., T],
-        synth_fn: Callable[[T, ...], T],
-        loss_fn: Callable[[T, T], T],
-        theta_fn_kwargs: Dict[str, Any],
-        params: List[Parameter],
-        n_theta: int,
-        theta_idx: Optional[int] = None,
-        synth_fn_kwargs: Optional[Dict[str, Any]] = None,
+    theta_fn: Callable[..., T],
+    synth_fn: Callable[[T, ...], T],
+    loss_fn: Callable[[T, T], T],
+    theta_fn_kwargs: Dict[str, Any],
+    params: List[Parameter],
+    n_theta: int,
+    theta_idx: Optional[int] = None,
+    synth_fn_kwargs: Optional[Dict[str, Any]] = None,
 ) -> T:
     if synth_fn_kwargs is None:
         synth_fn_kwargs = {}
@@ -80,10 +81,10 @@ def _calc_batch_theta_param_grad(
 
 
 def _calc_param_hvp(
-        tangent: T,
-        param_grad: T,
-        params: List[Parameter],
-        retain_graph: bool = False,
+    tangent: T,
+    param_grad: T,
+    params: List[Parameter],
+    retain_graph: bool = False,
 ) -> T:
     assert tangent.ndim == 1
     assert param_grad.shape == tangent.shape
@@ -100,9 +101,9 @@ def _calc_param_hvp(
 
 
 def _calc_largest_eig(
-        param_grad: T,
-        params: List[Parameter],
-        n_iter: int = 20,
+    param_grad: T,
+    params: List[Parameter],
+    n_iter: int = 20,
 ) -> T:
     apply_fn = functools.partial(
         _calc_param_hvp,
@@ -125,14 +126,14 @@ def _calc_largest_eig(
 
 
 def calc_theta_eigs(
-        theta_fn: Callable[..., T],
-        synth_fn: Callable[[T, ...], T],
-        loss_fn: Callable[[T, T], T],
-        theta_fn_kwargs: Dict[str, Any],
-        params: List[Parameter],
-        n_theta: int,
-        synth_fn_kwargs: Optional[Dict[str, Any]] = None,
-        n_iter: int = 20,
+    theta_fn: Callable[..., T],
+    synth_fn: Callable[[T, ...], T],
+    loss_fn: Callable[[T, T], T],
+    theta_fn_kwargs: Dict[str, Any],
+    params: List[Parameter],
+    n_theta: int,
+    synth_fn_kwargs: Optional[Dict[str, Any]] = None,
+    n_iter: int = 20,
 ) -> T:
     theta_param_grad = _calc_batch_theta_param_grad(
         theta_fn,
@@ -153,15 +154,15 @@ def calc_theta_eigs(
 
 
 def _calc_param_hvp_multibatch(
-        tangent: T,
-        theta_idx: int,
-        theta_fn: Callable[..., T],
-        synth_fn: Callable[[T, ...], T],
-        loss_fn: Callable[[T, T], T],
-        theta_fn_kwargs: List[Dict[str, Any]],
-        params: List[Parameter],
-        n_theta: int,
-        synth_fn_kwargs: Optional[List[Dict[str, Any]]] = None,
+    tangent: T,
+    theta_idx: int,
+    theta_fn: Callable[..., T],
+    synth_fn: Callable[[T, ...], T],
+    loss_fn: Callable[[T, T], T],
+    theta_fn_kwargs: List[Dict[str, Any]],
+    params: List[Parameter],
+    n_theta: int,
+    synth_fn_kwargs: Optional[List[Dict[str, Any]]] = None,
 ) -> T:
     if synth_fn_kwargs is None:
         assert theta_fn_kwargs, "theta_fn_kwargs must not be empty"
@@ -173,7 +174,7 @@ def _calc_param_hvp_multibatch(
         )
     param_hvp = None
     for curr_theta_fn_kwargs, curr_synth_fn_kwargs in zip(
-            theta_fn_kwargs, synth_fn_kwargs
+        theta_fn_kwargs, synth_fn_kwargs
     ):
         curr_param_grad = _calc_batch_theta_param_grad(
             theta_fn,
@@ -197,15 +198,15 @@ def _calc_param_hvp_multibatch(
 
 
 def _calc_theta_largest_eig_multibatch(
-        theta_idx: int,
-        theta_fn: Callable[..., T],
-        synth_fn: Callable[[T, ...], T],
-        loss_fn: Callable[[T, T], T],
-        theta_fn_kwargs: List[Dict[str, Any]],
-        params: List[Parameter],
-        n_theta: int,
-        synth_fn_kwargs: Optional[List[Dict[str, Any]]] = None,
-        n_iter: int = 20,
+    theta_idx: int,
+    theta_fn: Callable[..., T],
+    synth_fn: Callable[[T, ...], T],
+    loss_fn: Callable[[T, T], T],
+    theta_fn_kwargs: List[Dict[str, Any]],
+    params: List[Parameter],
+    n_theta: int,
+    synth_fn_kwargs: Optional[List[Dict[str, Any]]] = None,
+    n_iter: int = 20,
 ) -> T:
     apply_fn = functools.partial(
         _calc_param_hvp_multibatch,
@@ -233,14 +234,14 @@ def _calc_theta_largest_eig_multibatch(
 
 
 def calc_theta_eigs_multibatch(
-        theta_fn: Callable[..., T],
-        synth_fn: Callable[[T, ...], T],
-        loss_fn: Callable[[T, T], T],
-        theta_fn_kwargs: List[Dict[str, Any]],
-        params: List[Parameter],
-        n_theta: int,
-        synth_fn_kwargs: Optional[List[Dict[str, Any]]] = None,
-        n_iter: int = 20,
+    theta_fn: Callable[..., T],
+    synth_fn: Callable[[T, ...], T],
+    loss_fn: Callable[[T, T], T],
+    theta_fn_kwargs: List[Dict[str, Any]],
+    params: List[Parameter],
+    n_theta: int,
+    synth_fn_kwargs: Optional[List[Dict[str, Any]]] = None,
+    n_iter: int = 20,
 ) -> T:
     theta_eigs = []
     for theta_idx in range(n_theta):
@@ -261,9 +262,9 @@ def calc_theta_eigs_multibatch(
 
 
 def _aggregate_vals(
-        vals: T,
-        n_theta: int,
-        agg: Literal["none", "mean", "max", "med"] = "none",
+    vals: T,
+    n_theta: int,
+    agg: Literal["none", "mean", "max", "med"] = "none",
 ) -> T:
     assert vals.ndim == 2
     assert vals.size(1) == n_theta
@@ -282,10 +283,10 @@ def _aggregate_vals(
 
 
 def check_is_deterministic(
-        theta_fn: Callable[..., T],
-        theta_fn_kwargs: Dict[str, Any],
-        synth: Callable[[T, ...], T],
-        synth_fn_kwargs: Optional[Dict[str, Any]] = None,
+    theta_fn: Callable[..., T],
+    theta_fn_kwargs: Dict[str, Any],
+    synth: Callable[[T, ...], T],
+    synth_fn_kwargs: Optional[Dict[str, Any]] = None,
 ) -> bool:
     theta_hat_1 = theta_fn(**theta_fn_kwargs)
     theta_hat_2 = theta_fn(**theta_fn_kwargs)
@@ -306,16 +307,16 @@ def check_is_deterministic(
 
 
 def warmup_lc_hvp(
-        theta_fn: Callable[..., T],
-        synth_fn: Callable[[T, ...], T],
-        loss_fn: Callable[[T, T], T],
-        theta_fn_kwargs: List[Dict[str, Any]],
-        params: List[Parameter],
-        n_theta: int,
-        synth_fn_kwargs: Optional[List[Dict[str, Any]]] = None,
-        n_iter: int = 20,
-        agg: Literal["none", "mean", "max", "med"] = "none",
-        force_multibatch: bool = False,
+    theta_fn: Callable[..., T],
+    synth_fn: Callable[[T, ...], T],
+    loss_fn: Callable[[T, T], T],
+    theta_fn_kwargs: List[Dict[str, Any]],
+    params: List[Parameter],
+    n_theta: int,
+    synth_fn_kwargs: Optional[List[Dict[str, Any]]] = None,
+    n_iter: int = 20,
+    agg: Literal["none", "mean", "max", "med"] = "none",
+    force_multibatch: bool = False,
 ) -> T:
     assert params, "params must not be empty"
     assert all(
@@ -433,13 +434,14 @@ class DecoderJAX(eqx.Module):
 
 @eqx.filter_jit
 def warmup_lc_hvp_jax(
-        encoder: eqx.Module,
-        decoder: eqx.Module,
-        xs: Float[Array, "n_batches bs n_samples"],
-        key: Array,
-        n_theta: int,
-        n_iter: int = 20
-) -> Float[Array, "n_theta"]:
+    encoder: eqx.Module,
+    decoder: eqx.Module,
+    xs: Float[Array, "n_batches bs n_samples"],
+    key: Array,
+    n_theta: int,
+    n_iter: int = 20,
+    eps: float = 1e-12,
+) -> Tuple[Float[Array, "n_theta"], Float[Array, "n_theta n_iter"]]:
     # 1. Partition the encoder
     enc_train, enc_static = eqx.partition(encoder, eqx.is_array)
 
@@ -473,7 +475,8 @@ def warmup_lc_hvp_jax(
     def hvp_i(trainable, static, x_batch, theta_idx, tangent_tree):
         # By taking the JVP of the ENTIRE get_param_grad function,
         # JAX perfectly replicates PyTorch's product-rule curvature math.
-        def f(w): return get_param_grad(w, static, x_batch, theta_idx)
+        def f(w):
+            return get_param_grad(w, static, x_batch, theta_idx)
 
         _, hvp_tree = jax.jvp(f, (trainable,), (tangent_tree,))
         return hvp_tree
@@ -487,44 +490,56 @@ def warmup_lc_hvp_jax(
         # Sum the resulting HVPs across the batch axis (axis 0)
         return jax.tree_util.tree_map(lambda arr: jnp.sum(arr, axis=0), batch_hvps)
 
-    # --- HELPER: PyTree Math for Power Iteration ---
-    def tree_norm(tree):
-        leaves, _ = jax.tree_util.tree_flatten(tree)
-        return jnp.sqrt(sum(jnp.sum(l ** 2) for l in leaves))
+    def tree_l2_normalize(
+        tree: PyTree[Float[Array, "..."]], eps: float
+    ) -> PyTree[Float[Array, "..."]]:
+        norm = optax.tree_utils.tree_norm(tree, ord=2)
+        norm_tree = jax.tree.map(lambda x: x / (norm + eps), tree)
+        return norm_tree
 
-    def normalize(tree):
-        norm = tree_norm(tree)
-        return jax.tree_util.tree_map(lambda x: x / (norm + 1e-12), tree)
+    def get_eig_for_theta(
+        theta_idx: Int[Array, ""],
+    ) -> Tuple[Float[Array, ""], Float[Array, "n_iter"]]:
+        key_theta = jax.random.fold_in(key, theta_idx)
 
-    def tree_dot(t1, t2):
-        leaves1, _ = jax.tree_util.tree_flatten(t1)
-        leaves2, _ = jax.tree_util.tree_flatten(t2)
-        return sum(jnp.sum(l1 * l2) for l1, l2 in zip(leaves1, leaves2))
-
-    # --- MAIN LOOP: Compute Eigenvalue per Theta ---
-    def get_eig_for_theta(theta_idx):
-        k = jax.random.fold_in(key, theta_idx)
-
-        # Matched PyTorch's torch.rand initialization (Uniform [0, 1))
-        tangent = jax.tree_util.tree_map(
-            lambda p: jax.random.uniform(k, p.shape), enc_train
+        # Create a key for every leaf
+        leaves, treedef = jax.tree.flatten(enc_train)
+        key_leaves = jax.random.split(key_theta, len(leaves))
+        key_tree = jax.tree.unflatten(treedef, key_leaves)
+        tangent = jax.tree.map(
+            lambda k, p: jax.random.normal(k, p.shape), key_tree, enc_train
         )
-        tangent = normalize(tangent)
 
-        def power_iter_step(i, v):
-            Hv = multibatch_hvp(enc_train, enc_static, theta_idx, v)
-            return normalize(Hv)
+        def power_iter_step(
+            tangent: PyTree[Float[Array, "..."]], idx: Int[Array, ""]
+        ) -> Tuple[
+            PyTree[Float[Array, "..."]], Tuple[Float[Array, ""], Float[Array, ""]]
+        ]:
+            # Normalize the tangent vector
+            tangent = tree_l2_normalize(tangent, eps=eps)
+            # Compute the Hessian-vector product
+            Hv = multibatch_hvp(enc_train, enc_static, theta_idx, tangent)
+            # Estimate current eigenvalue (Rayleigh quotient)
+            eig = optax.tree_utils.tree_vdot(tangent, Hv)
+            # Calculate the residual tree: Hv - eigval * v
+            residual = jax.tree.map(lambda hv, v: hv - eig * v, Hv, tangent)
+            # Calculate the norm of the residual for convergence monitoring
+            error = optax.tree_utils.tree_norm(residual, ord=2)
+            return Hv, (eig, error)
 
-        # Standard Power Iteration loop using lax.fori_loop for fast compilation
-        final_tangent = jax.lax.fori_loop(0, n_iter, power_iter_step, tangent)
+        _, (eigs, errors) = jax.lax.scan(
+            f=power_iter_step,
+            init=tangent,
+            xs=jnp.arange(n_iter),
+        )
 
-        # Calculate final Rayleigh quotient: v^T * H * v
-        Hv = multibatch_hvp(enc_train, enc_static, theta_idx, final_tangent)
-        return jnp.abs(tree_dot(final_tangent, Hv))
+        eig = jnp.abs(eigs[-1])  # We only care about magnitude
+        return eig, errors
 
     # Vectorize the eigenvalue computation over all dimensions of theta!
     theta_indices = jnp.arange(n_theta)
-    return jax.vmap(get_eig_for_theta)(theta_indices)
+    eigs, errors = jax.vmap(get_eig_for_theta)(theta_indices)
+    return eigs, errors
 
 
 if __name__ == "__main__":
@@ -612,15 +627,17 @@ if __name__ == "__main__":
     hvp_key = jax.random.fold_in(master_key, 999)
 
     # with jax.disable_jit():
-    vals_jax = warmup_lc_hvp_jax(
+    vals_jax, errors_jax = warmup_lc_hvp_jax(
         encoder=encoder_jax,
         decoder=decoder_jax,
         xs=xs_jax,
         key=hvp_key,
         n_theta=n_theta,
-        n_iter=20
+        n_iter=20,
     )
 
     print("\n--- Eigenvalue Comparison ---")
     print("PyTorch Vals:", vals.detach().numpy())
     print("JAX Vals:    ", vals_jax)
+    print("\n--- JAX Power Iteration Errors ---")
+    print(errors_jax)
