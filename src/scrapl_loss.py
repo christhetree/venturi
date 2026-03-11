@@ -432,10 +432,21 @@ class DecoderJAX(eqx.Module):
         return x
 
 
+def tree_l2_normalize(
+    tree: PyTree[Float[Array, "..."]], eps: float
+) -> PyTree[Float[Array, "..."]]:
+    norm = optax.tree_utils.tree_norm(tree, ord=2)
+    norm_tree = jax.tree.map(lambda x: x / (norm + eps), tree)
+    return norm_tree
+
+
 @eqx.filter_jit
 def warmup_lc_hvp_jax(
     encoder: eqx.Module,
     decoder: eqx.Module,
+    loss_fn: Callable[
+        [Float[Array, "bs n_samples"], Float[Array, "bs n_samples"]], Float[Array, ""]
+    ],
     xs: Float[Array, "n_batches bs n_samples"],
     key: Array,
     n_theta: int,
@@ -443,59 +454,60 @@ def warmup_lc_hvp_jax(
     eps: float = 1e-12,
 ) -> Tuple[Float[Array, "n_theta"], Float[Array, "n_theta n_iter"]]:
     # 1. Partition the encoder
-    enc_train, enc_static = eqx.partition(encoder, eqx.is_array)
+    enc_w, enc_static = eqx.partition(encoder, eqx.is_array)
+
+    def encoder_forward(
+        w: eqx.Module, x: Float[Array, "bs n_samples"]
+    ) -> Float[Array, "bs n_theta"]:
+        curr_encoder = eqx.combine(w, enc_static)
+        theta = jax.vmap(curr_encoder)(x)
+        return theta
+
+    def calc_loss(
+        theta: Float[Array, "bs n_theta"],
+        x: Float[Array, "bs n_samples"],
+    ) -> Float[Array, ""]:
+        x_hat = jax.vmap(decoder)(theta)
+        loss = loss_fn(x, x_hat)
+        return loss
 
     # --- HELPER: The PyTorch `create_graph` equivalent ---
-    def get_param_grad(trainable, static, x_batch, theta_idx):
-        # We define a forward pass strictly for the VJP
-        def enc_forward(w):
-            e = eqx.combine(w, static)
-            return jax.vmap(e)(x_batch)
-
+    def get_param_grad(
+        w: eqx.Module, x: Float[Array, "bs n_samples"], theta_idx: Int[Array, ""]
+    ):
         # 1. Get theta and the VJP function (this tracks the encoder graph)
-        theta, vjp_fn = jax.vjp(enc_forward, trainable)
+        enc_fn = functools.partial(encoder_forward, x=x)
+        theta, vjp_fn = jax.vjp(enc_fn, w)
 
-        # 2. Compute loss gradient w.r.t theta
-        def get_loss(th):
-            x_hat = jax.vmap(decoder)(th)
-            return jnp.mean((x_batch - x_hat) ** 2)
+        # theta, dE_dw = jax.jvp(enc_fn, (w,), (w,))
 
-        # NO STOP_GRADIENT HERE! We let JAX track the derivative of the derivative.
-        dL_dtheta = jax.grad(get_loss)(theta)
+        dL_dtheta = jax.grad(calc_loss)(theta, x)
+        sensitivity = dL_dtheta[:, theta_idx]
 
         # 3. Mask to isolate the specific theta dimension
         mask = jnp.zeros_like(dL_dtheta).at[:, theta_idx].set(1.0)
         dL_dtheta_masked = dL_dtheta * mask
 
         # 4. Propagate the masked gradient back to the parameters
-        param_grad = vjp_fn(dL_dtheta_masked)[0]
+        (param_grad,) = vjp_fn(dL_dtheta_masked)
         return param_grad
 
     # --- HELPER: Hessian Vector Product ---
-    def hvp_i(trainable, static, x_batch, theta_idx, tangent_tree):
+    def hvp_i(w: eqx.Module, x_batch, theta_idx: Int[Array, ""], tangent_tree):
         # By taking the JVP of the ENTIRE get_param_grad function,
         # JAX perfectly replicates PyTorch's product-rule curvature math.
         def f(w):
-            return get_param_grad(w, static, x_batch, theta_idx)
+            return get_param_grad(w, x_batch, theta_idx)
 
-        _, hvp_tree = jax.jvp(f, (trainable,), (tangent_tree,))
+        _, hvp_tree = jax.jvp(f, (w,), (tangent_tree,))
         return hvp_tree
 
     # --- HELPER: Multibatch Summation ---
-    def multibatch_hvp(trainable, static, theta_idx, tangent_tree):
+    def multibatch_hvp(w: eqx.Module, theta_idx: Int[Array, ""], tangent_tree):
         # Map the HVP calculation over all batches
-        batch_hvps = jax.vmap(
-            lambda x: hvp_i(trainable, static, x, theta_idx, tangent_tree)
-        )(xs)
+        batch_hvps = jax.vmap(lambda x: hvp_i(w, x, theta_idx, tangent_tree))(xs)
         # Sum the resulting HVPs across the batch axis (axis 0)
         return jax.tree_util.tree_map(lambda arr: jnp.sum(arr, axis=0), batch_hvps)
-
-    def tree_l2_normalize(
-        tree: PyTree[Float[Array, "..."]], eps: float
-    ) -> PyTree[Float[Array, "..."]]:
-        norm = optax.tree_utils.tree_norm(tree, ord=2)
-        norm_tree = jax.tree.map(lambda x: x / (norm + eps), tree)
-        return norm_tree
 
     def get_eig_for_theta(
         theta_idx: Int[Array, ""],
@@ -503,11 +515,11 @@ def warmup_lc_hvp_jax(
         key_theta = jax.random.fold_in(key, theta_idx)
 
         # Create a key for every leaf
-        leaves, treedef = jax.tree.flatten(enc_train)
+        leaves, treedef = jax.tree.flatten(enc_w)
         key_leaves = jax.random.split(key_theta, len(leaves))
         key_tree = jax.tree.unflatten(treedef, key_leaves)
         tangent = jax.tree.map(
-            lambda k, p: jax.random.normal(k, p.shape), key_tree, enc_train
+            lambda k, p: jax.random.normal(k, p.shape), key_tree, enc_w
         )
 
         def power_iter_step(
@@ -518,7 +530,7 @@ def warmup_lc_hvp_jax(
             # Normalize the tangent vector
             tangent = tree_l2_normalize(tangent, eps=eps)
             # Compute the Hessian-vector product
-            Hv = multibatch_hvp(enc_train, enc_static, theta_idx, tangent)
+            Hv = multibatch_hvp(enc_w, theta_idx, tangent)
             # Estimate current eigenvalue (Rayleigh quotient)
             eig = optax.tree_utils.tree_vdot(tangent, Hv)
             # Calculate the residual tree: Hv - eigval * v
@@ -623,21 +635,24 @@ if __name__ == "__main__":
     # Shape becomes (n_batches, bs, n_samples)
     xs_jax = jnp.stack([jnp.array(b.numpy()) for b in theta_is_batches])
 
+    loss_fn_jax = lambda x, x_hat: jnp.mean((x - x_hat) ** 2)
+
     # Generate a dedicated key for the random tangents in power iteration
     hvp_key = jax.random.fold_in(master_key, 999)
 
-    # with jax.disable_jit():
-    vals_jax, errors_jax = warmup_lc_hvp_jax(
-        encoder=encoder_jax,
-        decoder=decoder_jax,
-        xs=xs_jax,
-        key=hvp_key,
-        n_theta=n_theta,
-        n_iter=20,
-    )
+    with jax.disable_jit():
+        vals_jax, errors_jax = warmup_lc_hvp_jax(
+            encoder=encoder_jax,
+            decoder=decoder_jax,
+            loss_fn=loss_fn_jax,
+            xs=xs_jax,
+            key=hvp_key,
+            n_theta=n_theta,
+            n_iter=20,
+        )
 
     print("\n--- Eigenvalue Comparison ---")
     print("PyTorch Vals:", vals.detach().numpy())
     print("JAX Vals:    ", vals_jax)
-    print("\n--- JAX Power Iteration Errors ---")
-    print(errors_jax)
+    # print("\n--- JAX Power Iteration Errors ---")
+    # print(errors_jax)
