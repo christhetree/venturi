@@ -453,7 +453,6 @@ def warmup_lc_hvp_jax(
     n_iter: int = 20,
     eps: float = 1e-12,
 ) -> Tuple[Float[Array, "n_theta"], Float[Array, "n_theta n_iter"]]:
-    # 1. Partition the encoder
     enc_w, enc_static = eqx.partition(encoder, eqx.is_array)
 
     def encoder_forward(
@@ -471,45 +470,53 @@ def warmup_lc_hvp_jax(
         loss = loss_fn(x, x_hat)
         return loss
 
-    # --- HELPER: The PyTorch `create_graph` equivalent ---
-    def get_param_grad(
-        w: eqx.Module, x: Float[Array, "bs n_samples"], theta_idx: Int[Array, ""]
-    ):
-        # 1. Get theta and the VJP function (this tracks the encoder graph)
+    def calc_sensitivity(
+        theta: Float[Array, "bs n_theta"],
+        x: Float[Array, "bs n_samples"],
+    ) -> Float[Array, "bs n_theta"]:
+        dL_dtheta = jax.grad(calc_loss)(theta, x)
+        return dL_dtheta
+
+    def calc_s_dE_dw_at_theta(
+        w: eqx.Module,
+        theta_idx: Int[Array, ""],
+        x: Float[Array, "bs n_samples"],
+    ) -> PyTree[Float[Array, "..."]]:
         enc_fn = functools.partial(encoder_forward, x=x)
         theta, vjp_fn = jax.vjp(enc_fn, w)
 
-        # theta, dE_dw = jax.jvp(enc_fn, (w,), (w,))
+        # Sensitivity must be computed inside the HVP each time since it depends on w
+        sensitivity = calc_sensitivity(theta, x)
+        s_at_theta = sensitivity[:, theta_idx]
 
-        dL_dtheta = jax.grad(calc_loss)(theta, x)
-        sensitivity = dL_dtheta[:, theta_idx]
+        s_theta_idx_one_hot = jnp.zeros_like(theta).at[:, theta_idx].set(s_at_theta)
+        (s_dE_dw_at_theta,) = vjp_fn(s_theta_idx_one_hot)
+        return s_dE_dw_at_theta
 
-        # 3. Mask to isolate the specific theta dimension
-        mask = jnp.zeros_like(dL_dtheta).at[:, theta_idx].set(1.0)
-        dL_dtheta_masked = dL_dtheta * mask
+    def calc_hvp_at_theta(
+        w: eqx.Module,
+        theta_idx: Int[Array, ""],
+        x: Float[Array, "bs n_samples"],
+        tangent: PyTree[Float[Array, "..."]],
+    ) -> PyTree[Float[Array, "..."]]:
+        s_dE_dw_fn = functools.partial(calc_s_dE_dw_at_theta, theta_idx=theta_idx, x=x)
+        _, tangent_out = jax.jvp(s_dE_dw_fn, (w,), (tangent,))
+        return tangent_out
 
-        # 4. Propagate the masked gradient back to the parameters
-        (param_grad,) = vjp_fn(dL_dtheta_masked)
-        return param_grad
-
-    # --- HELPER: Hessian Vector Product ---
-    def hvp_i(w: eqx.Module, x_batch, theta_idx: Int[Array, ""], tangent_tree):
-        # By taking the JVP of the ENTIRE get_param_grad function,
-        # JAX perfectly replicates PyTorch's product-rule curvature math.
-        def f(w):
-            return get_param_grad(w, x_batch, theta_idx)
-
-        _, hvp_tree = jax.jvp(f, (w,), (tangent_tree,))
-        return hvp_tree
-
-    # --- HELPER: Multibatch Summation ---
-    def multibatch_hvp(w: eqx.Module, theta_idx: Int[Array, ""], tangent_tree):
-        # Map the HVP calculation over all batches
-        batch_hvps = jax.vmap(lambda x: hvp_i(w, x, theta_idx, tangent_tree))(xs)
+    def calc_multibatch_hvp(
+        w: eqx.Module, theta_idx: Int[Array, ""], tangent: PyTree[Float[Array, "..."]]
+    ):
+        # Vectorize the HVP calculation across the batch dimension of xs
+        tangent_outs = jax.vmap(lambda x: calc_hvp_at_theta(w, theta_idx, x, tangent))(
+            xs
+        )
         # Sum the resulting HVPs across the batch axis (axis 0)
-        return jax.tree_util.tree_map(lambda arr: jnp.sum(arr, axis=0), batch_hvps)
+        Hv = jax.tree_util.tree_map(
+            lambda t_out: jnp.sum(t_out, axis=0), tangent_outs
+        )
+        return Hv
 
-    def get_eig_for_theta(
+    def calc_largest_eig(
         theta_idx: Int[Array, ""],
     ) -> Tuple[Float[Array, ""], Float[Array, "n_iter"]]:
         key_theta = jax.random.fold_in(key, theta_idx)
@@ -530,7 +537,7 @@ def warmup_lc_hvp_jax(
             # Normalize the tangent vector
             tangent = tree_l2_normalize(tangent, eps=eps)
             # Compute the Hessian-vector product
-            Hv = multibatch_hvp(enc_w, theta_idx, tangent)
+            Hv = calc_multibatch_hvp(enc_w, theta_idx, tangent)
             # Estimate current eigenvalue (Rayleigh quotient)
             eig = optax.tree_utils.tree_vdot(tangent, Hv)
             # Calculate the residual tree: Hv - eigval * v
@@ -548,9 +555,9 @@ def warmup_lc_hvp_jax(
         eig = jnp.abs(eigs[-1])  # We only care about magnitude
         return eig, errors
 
-    # Vectorize the eigenvalue computation over all dimensions of theta!
+    # Vectorize the eigenvalue computation over all dimensions of theta
     theta_indices = jnp.arange(n_theta)
-    eigs, errors = jax.vmap(get_eig_for_theta)(theta_indices)
+    eigs, errors = jax.vmap(calc_largest_eig)(theta_indices)
     return eigs, errors
 
 
