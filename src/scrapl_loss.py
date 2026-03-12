@@ -474,6 +474,8 @@ def warmup_lc_hvp_jax(
         theta: Float[Array, "bs n_theta"],
         x: Float[Array, "bs n_samples"],
     ) -> Float[Array, "bs n_theta"]:
+        # jax.grad uses jax.vjp under the hood, and pulls back the grad of the loss
+        # function w.r.t. theta (i.e. the first parameter of the function)
         dL_dtheta = jax.grad(calc_loss)(theta, x)
         return dL_dtheta
 
@@ -481,8 +483,11 @@ def warmup_lc_hvp_jax(
         w: eqx.Module,
         theta_idx: Int[Array, ""],
         x: Float[Array, "bs n_samples"],
-    ) -> PyTree[Float[Array, "..."]]:
+    ) -> eqx.Module:
         enc_fn = functools.partial(encoder_forward, x=x)
+        # We use jax.vjp here instead of jax.jvp since we want the gradient of the
+        # encoder w.r.t. the weights (n_theta x w) at theta_idx (1 x w), which means
+        # dim_out << dim_in and vjp is much more efficient than jvp
         theta, vjp_fn = jax.vjp(enc_fn, w)
 
         # Sensitivity must be computed inside the HVP each time since it depends on w
@@ -497,43 +502,43 @@ def warmup_lc_hvp_jax(
         w: eqx.Module,
         theta_idx: Int[Array, ""],
         x: Float[Array, "bs n_samples"],
-        tangent: PyTree[Float[Array, "..."]],
-    ) -> PyTree[Float[Array, "..."]]:
+        tangent: eqx.Module,
+    ) -> eqx.Module:
         s_dE_dw_fn = functools.partial(calc_s_dE_dw_at_theta, theta_idx=theta_idx, x=x)
         _, tangent_out = jax.jvp(s_dE_dw_fn, (w,), (tangent,))
         return tangent_out
 
     def calc_multibatch_hvp(
-        w: eqx.Module, theta_idx: Int[Array, ""], tangent: PyTree[Float[Array, "..."]]
+        w: eqx.Module, theta_idx: Int[Array, ""], tangent: eqx.Module
     ):
         # Vectorize the HVP calculation across the batch dimension of xs
         tangent_outs = jax.vmap(lambda x: calc_hvp_at_theta(w, theta_idx, x, tangent))(
             xs
         )
         # Sum the resulting HVPs across the batch axis (axis 0)
-        Hv = jax.tree_util.tree_map(
-            lambda t_out: jnp.sum(t_out, axis=0), tangent_outs
-        )
+        Hv = jax.tree.map(lambda t_out: jnp.sum(t_out, axis=0), tangent_outs)
         return Hv
 
-    def calc_largest_eig(
-        theta_idx: Int[Array, ""],
-    ) -> Tuple[Float[Array, ""], Float[Array, "n_iter"]]:
-        key_theta = jax.random.fold_in(key, theta_idx)
-
+    def generate_random_tangent(key: Array) -> eqx.Module:
         # Create a key for every leaf
         leaves, treedef = jax.tree.flatten(enc_w)
-        key_leaves = jax.random.split(key_theta, len(leaves))
+        key_leaves = jax.random.split(key, len(leaves))
         key_tree = jax.tree.unflatten(treedef, key_leaves)
+        # Initialize a random tangent vector with the same structure as enc_w
         tangent = jax.tree.map(
             lambda k, p: jax.random.normal(k, p.shape), key_tree, enc_w
         )
+        return tangent
+
+    def calc_largest_eig_power_iter(
+        theta_idx: Int[Array, ""],
+    ) -> Tuple[Float[Array, ""], Float[Array, "n_iter"]]:
+        key_theta = jax.random.fold_in(key, theta_idx)
+        tangent = generate_random_tangent(key_theta)
 
         def power_iter_step(
-            tangent: PyTree[Float[Array, "..."]], idx: Int[Array, ""]
-        ) -> Tuple[
-            PyTree[Float[Array, "..."]], Tuple[Float[Array, ""], Float[Array, ""]]
-        ]:
+            tangent: eqx.Module, idx: Int[Array, ""]
+        ) -> Tuple[eqx.Module, Tuple[Float[Array, ""], Float[Array, ""]]]:
             # Normalize the tangent vector
             tangent = tree_l2_normalize(tangent, eps=eps)
             # Compute the Hessian-vector product
@@ -546,6 +551,7 @@ def warmup_lc_hvp_jax(
             error = optax.tree_utils.tree_norm(residual, ord=2)
             return Hv, (eig, error)
 
+        # Run power iteration for n_iter steps, collecting eigenval estimates and errors
         _, (eigs, errors) = jax.lax.scan(
             f=power_iter_step,
             init=tangent,
@@ -557,7 +563,7 @@ def warmup_lc_hvp_jax(
 
     # Vectorize the eigenvalue computation over all dimensions of theta
     theta_indices = jnp.arange(n_theta)
-    eigs, errors = jax.vmap(calc_largest_eig)(theta_indices)
+    eigs, errors = jax.vmap(calc_largest_eig_power_iter)(theta_indices)
     return eigs, errors
 
 
@@ -647,16 +653,16 @@ if __name__ == "__main__":
     # Generate a dedicated key for the random tangents in power iteration
     hvp_key = jax.random.fold_in(master_key, 999)
 
-    with jax.disable_jit():
-        vals_jax, errors_jax = warmup_lc_hvp_jax(
-            encoder=encoder_jax,
-            decoder=decoder_jax,
-            loss_fn=loss_fn_jax,
-            xs=xs_jax,
-            key=hvp_key,
-            n_theta=n_theta,
-            n_iter=20,
-        )
+    # with jax.disable_jit():
+    vals_jax, errors_jax = warmup_lc_hvp_jax(
+        encoder=encoder_jax,
+        decoder=decoder_jax,
+        loss_fn=loss_fn_jax,
+        xs=xs_jax,
+        key=hvp_key,
+        n_theta=n_theta,
+        n_iter=20,
+    )
 
     print("\n--- Eigenvalue Comparison ---")
     print("PyTorch Vals:", vals.detach().numpy())
