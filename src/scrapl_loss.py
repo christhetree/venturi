@@ -1,12 +1,16 @@
+import contextlib
 import functools
+import gc
 import logging
 import os
+import time
 from typing import Optional, List, Dict, Any, Callable, Literal, Tuple
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
+import psutil
 import torch as tr
 from jaxtyping import Array, Float, PyTree, Int
 from torch import Tensor as T, nn
@@ -498,26 +502,14 @@ def warmup_lc_hvp_jax(
         (s_dE_dw_at_theta,) = vjp_fn(s_theta_idx_one_hot)
         return s_dE_dw_at_theta
 
-    def calc_hvp_at_theta(
+    def calc_s_dE_dw_sum(
         w: eqx.Module,
         theta_idx: Int[Array, ""],
-        x: Float[Array, "bs n_samples"],
-        tangent: eqx.Module,
+        xs: Float[Array, "n_batches bs n_samples"],
     ) -> eqx.Module:
-        s_dE_dw_fn = functools.partial(calc_s_dE_dw_at_theta, theta_idx=theta_idx, x=x)
-        _, tangent_out = jax.jvp(s_dE_dw_fn, (w,), (tangent,))
-        return tangent_out
-
-    def calc_multibatch_hvp(
-        w: eqx.Module, theta_idx: Int[Array, ""], tangent: eqx.Module
-    ):
-        # Vectorize the HVP calculation across the batch dimension of xs
-        tangent_outs = jax.vmap(lambda x: calc_hvp_at_theta(w, theta_idx, x, tangent))(
-            xs
-        )
-        # Sum the resulting HVPs across the batch axis (axis 0)
-        Hv = jax.tree.map(lambda t_out: jnp.sum(t_out, axis=0), tangent_outs)
-        return Hv
+        grads = jax.vmap(lambda x: calc_s_dE_dw_at_theta(w, theta_idx, x))(xs)
+        s_dE_dw_sum = jax.tree.map(lambda g: jnp.sum(g, axis=0), grads)
+        return s_dE_dw_sum
 
     def generate_random_tangent(key: Array) -> eqx.Module:
         # Create a key for every leaf
@@ -540,13 +532,15 @@ def warmup_lc_hvp_jax(
             tangent: eqx.Module, idx: Int[Array, ""]
         ) -> Tuple[eqx.Module, Tuple[Float[Array, ""], Float[Array, ""]]]:
             # Normalize the tangent vector
-            tangent = tree_l2_normalize(tangent, eps=eps)
-            # Compute the Hessian-vector product
-            Hv = calc_multibatch_hvp(enc_w, theta_idx, tangent)
+            tangent_norm = tree_l2_normalize(tangent, eps=eps)
+            # Calculate the HVP. Since the JVP operator is linear, we can sum all the
+            # first order grads and then do a single JVP for the second order grad
+            grad_fn = functools.partial(calc_s_dE_dw_sum, theta_idx=theta_idx, xs=xs)
+            _, Hv = jax.jvp(grad_fn, (enc_w,), (tangent_norm,))
             # Estimate current eigenvalue (Rayleigh quotient)
-            eig = optax.tree_utils.tree_vdot(tangent, Hv)
-            # Calculate the residual tree: Hv - eigval * v
-            residual = jax.tree.map(lambda hv, v: hv - eig * v, Hv, tangent)
+            eig = optax.tree_utils.tree_vdot(tangent_norm, Hv)
+            # Calculate the residual tree: Hv - eig * v
+            residual = jax.tree.map(lambda hv, v: hv - eig * v, Hv, tangent_norm)
             # Calculate the norm of the residual for convergence monitoring
             error = optax.tree_utils.tree_norm(residual, ord=2)
             return Hv, (eig, error)
@@ -653,16 +647,32 @@ if __name__ == "__main__":
     # Generate a dedicated key for the random tangents in power iteration
     hvp_key = jax.random.fold_in(master_key, 999)
 
+    def get_cpu_memory_mb() -> float:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024**2)
+
+    gc.collect()  # Clear Python references
+    initial_mem = get_cpu_memory_mb()
+
+    start_time = time.perf_counter()
     # with jax.disable_jit():
-    vals_jax, errors_jax = warmup_lc_hvp_jax(
-        encoder=encoder_jax,
-        decoder=decoder_jax,
-        loss_fn=loss_fn_jax,
-        xs=xs_jax,
-        key=hvp_key,
-        n_theta=n_theta,
-        n_iter=20,
-    )
+    with contextlib.nullcontext():
+        vals_jax, errors_jax = warmup_lc_hvp_jax(
+            encoder=encoder_jax,
+            decoder=decoder_jax,
+            loss_fn=loss_fn_jax,
+            xs=xs_jax,
+            key=hvp_key,
+            n_theta=n_theta,
+            n_iter=20,
+        )
+    jax.tree.map(lambda x: x.block_until_ready(), (vals_jax, errors_jax))
+    end_time = time.perf_counter()
+    elapsed_time = end_time - start_time
+    log.info(f"JAX warmup_lc_hvp_jax took {elapsed_time:.4f} seconds")
+
+    final_mem = get_cpu_memory_mb()
+    log.info(f"Memory increase: {final_mem - initial_mem:.2f} MB")
 
     print("\n--- Eigenvalue Comparison ---")
     print("PyTorch Vals:", vals.detach().numpy())
