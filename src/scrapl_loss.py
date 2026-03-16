@@ -478,7 +478,7 @@ def warmup_lc_hvp_jax(
         theta: Float[Array, "bs n_theta"],
         x: Float[Array, "bs n_samples"],
     ) -> Float[Array, "bs n_theta"]:
-        # jax.grad uses jax.vjp under the hood, and pulls back the grad of the loss
+        # jax.grad uses jax.vjp under the hood and pulls back the grad of the loss
         # function w.r.t. theta (i.e. the first parameter of the function)
         dL_dtheta = jax.grad(calc_loss)(theta, x)
         return dL_dtheta
@@ -490,7 +490,7 @@ def warmup_lc_hvp_jax(
     ) -> eqx.Module:
         enc_fn = functools.partial(encoder_forward, x=x)
         # We use jax.vjp here instead of jax.jvp since we want the gradient of the
-        # encoder w.r.t. the weights (n_theta x w) at theta_idx (1 x w), which means
+        # encoder w.r.t. the weights (n_theta, w) at theta_idx (1, w), which means
         # dim_out << dim_in and vjp is much more efficient than jvp
         theta, vjp_fn = jax.vjp(enc_fn, w)
 
@@ -502,14 +502,17 @@ def warmup_lc_hvp_jax(
         (s_dE_dw_at_theta,) = vjp_fn(s_theta_idx_one_hot)
         return s_dE_dw_at_theta
 
-    def calc_s_dE_dw_sum(
+    def calc_hvp_at_theta(
+        carry: eqx.Module,
+        x: Float[Array, "bs n_samples"],
         w: eqx.Module,
         theta_idx: Int[Array, ""],
-        xs: Float[Array, "n_batches bs n_samples"],
-    ) -> eqx.Module:
-        grads = jax.vmap(lambda x: calc_s_dE_dw_at_theta(w, theta_idx, x))(xs)
-        s_dE_dw_sum = jax.tree.map(lambda g: jnp.sum(g, axis=0), grads)
-        return s_dE_dw_sum
+        tangent: eqx.Module,
+    ) -> Tuple[eqx.Module, eqx.Module]:
+        s_dE_dw_fn = functools.partial(calc_s_dE_dw_at_theta, theta_idx=theta_idx, x=x)
+        _, tangent_out = jax.jvp(s_dE_dw_fn, (w,), (tangent,))
+        new_carry = jax.tree.map(jnp.add, carry, tangent_out)
+        return new_carry, tangent_out
 
     def generate_random_tangent(key: Array) -> eqx.Module:
         # Create a key for every leaf
@@ -527,16 +530,19 @@ def warmup_lc_hvp_jax(
     ) -> Tuple[Float[Array, ""], Float[Array, "n_iter"]]:
         key_theta = jax.random.fold_in(key, theta_idx)
         tangent = generate_random_tangent(key_theta)
+        Hv_init = jax.tree.map(lambda t: jnp.zeros_like(t), tangent)
 
         def power_iter_step(
             tangent: eqx.Module, idx: Int[Array, ""]
         ) -> Tuple[eqx.Module, Tuple[Float[Array, ""], Float[Array, ""]]]:
             # Normalize the tangent vector
             tangent_norm = tree_l2_normalize(tangent, eps=eps)
-            # Calculate the HVP. Since the JVP operator is linear, we can sum all the
-            # first order grads and then do a single JVP for the second order grad
-            grad_fn = functools.partial(calc_s_dE_dw_sum, theta_idx=theta_idx, xs=xs)
-            _, Hv = jax.jvp(grad_fn, (enc_w,), (tangent_norm,))
+            # Calculate the HVP. We use scan here instead of associative scan or vmap
+            # since using parallelism would result in OOM errors
+            hvp_fn = functools.partial(
+                calc_hvp_at_theta, w=enc_w, theta_idx=theta_idx, tangent=tangent_norm
+            )
+            Hv, _ = jax.lax.scan(f=hvp_fn, init=Hv_init, xs=xs)
             # Estimate current eigenvalue (Rayleigh quotient)
             eig = optax.tree_utils.tree_vdot(tangent_norm, Hv)
             # Calculate the residual tree: Hv - eig * v
@@ -556,6 +562,7 @@ def warmup_lc_hvp_jax(
         return eig, errors
 
     # Vectorize the eigenvalue computation over all dimensions of theta
+    # TODO(cm): make this sequential if memory becomes an issue
     theta_indices = jnp.arange(n_theta)
     eigs, errors = jax.vmap(calc_largest_eig_power_iter)(theta_indices)
     return eigs, errors
@@ -569,7 +576,7 @@ if __name__ == "__main__":
     bs = 4
     n_samples = 8096
     n_theta = 3
-    n_batches = 1
+    n_batches = 10
 
     enc_key, dec_key, data_key = jax.random.split(master_key, 3)
     batched_inference_fn_jax = eqx.filter_jit(
