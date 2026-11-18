@@ -16,8 +16,11 @@ as an argument.
 For a config and a seed, `fit` trains with AdamW (or any optax optimizer), validates
 after every epoch, and keeps the checkpoint with the lowest validation loss; `test`
 evaluates a checkpoint on the test set, also in a separate process.
-Losses are logged to TensorBoard (event files in the run directory, viewable with
-`tensorboard --logdir out/jax_logs`) and the test audio is saved to `AUDIO_SAVE_DIR`.
+Losses, and the audio of the first `trainer.n_val_audio` validation items after every
+epoch, are logged to TensorBoard (event files in the run directory), viewable with
+`tensorboard --logdir out/jax_logs --samples_per_plugin audio=1000` (by default,
+TensorBoard only keeps 10 random steps of each audio tag). The test audio is saved to
+`AUDIO_SAVE_DIR`.
 """
 
 import copy
@@ -209,6 +212,30 @@ def save_test_audio(
         )
 
 
+def log_val_audio(
+    writer: SummaryWriter,
+    outputs: list[dict[str, np.ndarray]],
+    n: int,
+    step: int,
+    sr: int,
+    log_targets: bool,
+) -> None:
+    """Logs the first `n` validation items to TensorBoard's Audio tab: the
+    predictions (`val_audio/<idx>/prediction`) and, if `log_targets`, the targets
+    (`val_audio/<idx>/target`). The validation set is not shuffled, so `<idx>` is the
+    same item at every epoch."""
+    if n <= 0 or not outputs:
+        return
+    x = np.concatenate([o["x"] for o in outputs])[:n]
+    x_hat = np.concatenate([o["x_hat"] for o in outputs])[:n]
+    for idx in range(x.shape[0]):
+        if log_targets:
+            writer.add_audio(f"val_audio/{idx}/target", x[idx], step, sample_rate=sr)
+        writer.add_audio(
+            f"val_audio/{idx}/prediction", x_hat[idx], step, sample_rate=sr
+        )
+
+
 @dataclass
 class Run:
     """What `fit` and `test` build from a config and a seed."""
@@ -270,6 +297,8 @@ def fit(config: dict[str, Any], seed: int) -> float:
     # Training losses are copied to the host (which waits for the GPU) only every
     # `log_every_n_steps` steps and at the end of each epoch
     log_every_n_steps = trainer_cfg.get("log_every_n_steps", 50)
+    # Validation items logged as audio after every epoch (the targets only once)
+    n_val_audio = trainer_cfg.get("n_val_audio", 4)
     with open(os.path.join(run.dir, "config.yml"), "w") as f:
         yaml.safe_dump(run.config, f, sort_keys=False)
     writer = SummaryWriter(log_dir=run.dir)
@@ -302,10 +331,15 @@ def fit(config: dict[str, Any], seed: int) -> float:
                 pending = []
         log_train_steps(writer, pending, accumulate, pbar)
 
-        val_loss, _ = evaluate(model, loss, data, "val")
+        val_loss, val_outputs = evaluate(
+            model, loss, data, "val", n_outputs=n_val_audio
+        )
         step = n_batches_seen // accumulate
         writer.add_scalar("val/loss", val_loss, step)
         writer.add_scalar("epoch", epoch, step)
+        log_val_audio(
+            writer, val_outputs, n_val_audio, step, data.sr, log_targets=epoch == 0
+        )
         writer.flush()
         is_best = val_loss < best_val_loss
         log.info(

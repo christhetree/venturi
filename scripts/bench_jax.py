@@ -7,7 +7,6 @@ XLA_FLAGS=--xla_gpu_deterministic_ops=false python scripts/bench_jax.py
 import os
 import sys
 import time
-from functools import partial
 
 sys.path.insert(0, os.path.abspath(os.path.join(__file__, "../../")))
 
@@ -90,13 +89,8 @@ bench(f"audio loss fwd+bwd ({type(loss.loss_func).__name__})", audio_loss_grad, 
 # The parts of the synth (forward + backward)
 n = x.shape[-1]
 u = jax.random.uniform(key, (bs, n), minval=-1.0, maxval=1.0)
-fe = jax.random.uniform(key, (bs, n + 1), maxval=0.3)  # Phase increments
 decay_ms = jnp.full((bs, 1), 500.0)
 b, a = highpass_coefficients(jnp.full((bs, 1), 200.0), jnp.full((bs, 1), 0.7), 44100)
-scan_add = partial(jax.lax.associative_scan, jnp.add, axis=-1)
-for name, cumsum in [("jnp.cumsum", partial(jnp.cumsum, axis=-1)), ("associative_scan", scan_add)]:  # fmt: skip
-    f = jax.jit(jax.grad(lambda fe_: jnp.sin(cumsum(fe_)).sum()))
-    bench(f"  oscillator phase, {name} (x2)", f, fe)
 f = jax.jit(jax.grad(lambda d: exp_decay_envelope(d, 44100, n).sum()))
 bench("  decay envelope (x4)", f, decay_ms)
 f = jax.jit(jax.grad(lambda u_: time_shift(u_, delta, -2048).sum()))

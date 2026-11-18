@@ -13,6 +13,7 @@ trainer:
   max_epochs: 50
   accumulate_grad_batches: 1
   log_every_n_steps: 50           # how often training losses are copied to the host
+  n_val_audio: 4                  # val items logged to TensorBoard as audio every epoch
   compilation_cache_dir: out/jax_cache  # relative to the repository root
 
 data:

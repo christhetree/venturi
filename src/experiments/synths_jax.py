@@ -50,8 +50,10 @@ def sinusoidal_oscillator(
     freq_env = freq_env + mod_env * mod_amount * f0
     # Prepend a zero so the phase starts at 0, then integrate. With a parallel
     # `associative_scan` rather than `jnp.cumsum`, which JAX lowers to an O(n^2)
-    # `reduce_window` that XLA has to rewrite (fine on CPU, possibly slow on GPU for
-    # n = 44100); both have the same float32 accuracy here
+    # `reduce_window` that XLA has to rewrite: on GPU, this took the synth's forward
+    # and backward pass in the training step from 182 ms to 77 ms (a standalone
+    # `jnp.cumsum` is fast, so this depends on the surrounding ops). Both have the same
+    # float32 accuracy here
     freq_env = jnp.concatenate([jnp.zeros_like(freq_env[:, :1]), freq_env], axis=-1)
     phase = jax.lax.associative_scan(jnp.add, freq_env, axis=-1)[:, :-1]
     return jnp.sin(phase)
@@ -96,8 +98,9 @@ def biquad_scan(
     which this synth's parameter range includes.
 
     `unroll` samples are computed per loop iteration. On GPU, every iteration has a
-    fixed overhead: for (8, 44100) samples, the forward and backward passes took
-    909 ms with `unroll=1`, 53 ms with `unroll=16`, and 12 ms with `unroll=128`. But
+    fixed overhead: for (8, 44100) samples, the forward and backward passes (with the
+    gradients of the coefficients) took 1091 ms with `unroll=1`, 67 ms with
+    `unroll=16`, and 17 ms with `unroll=128`. But
     the float32 rounding error grows with `unroll` for low cutoffs with high Q: the
     max error vs. float64 for 20 Hz, Q = 10 (peak ~1.2) is 3e-3 with `unroll=1` or 2,
     1e-2 with 16, and 6e-2 with 128 (on CPU). At 1 kHz, Q = 0.7, it is ~1e-5 for all.
