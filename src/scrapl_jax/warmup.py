@@ -6,6 +6,7 @@ from functools import partial
 from numbers import Integral
 from typing import Any, Callable, NamedTuple
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -13,7 +14,6 @@ import optax
 from jaxtyping import Array, Bool, Float, Int, Key, PyTree
 from tqdm import tqdm
 
-from .loss import SCRAPLLoss
 from .util import tree_l2_normalize
 
 logging.basicConfig()
@@ -22,43 +22,43 @@ log.setLevel(level=os.environ.get("LOGLEVEL", "INFO"))
 
 
 class ThetaISResult(NamedTuple):
-    """Per-path curvature estimates, final relative residuals, and probabilities.
+    """Per-loss curvature estimates, final relative residuals, and probabilities.
 
-    `curvatures` and `relative_residuals` have shape `(n_paths, n_theta)` and
-    `probs` has shape `(n_paths,)`.
+    `curvatures` and `relative_residuals` have shape `(n_losses, n_theta)` and
+    `probs` has shape `(n_losses,)`.
     """
 
-    curvatures: Float[Array, "n_paths n_theta"]
-    relative_residuals: Float[Array, "n_paths n_theta"]
-    probs: Float[Array, "n_paths"]
+    curvatures: Float[Array, "n_losses n_theta"]
+    relative_residuals: Float[Array, "n_losses n_theta"]
+    probs: Float[Array, "n_losses"]
 
 
 def theta_importance_probs(
-    curvatures: Float[Array, "n_paths n_theta"],
+    curvatures: Float[Array, "n_losses n_theta"],
     *,
     min_prob_frac: float = 0.0,
     eps: float = 1e-12,
-) -> Float[Array, "n_paths"]:
-    """Computes path sampling probabilities from per-theta curvature estimates.
+) -> Float[Array, "n_losses"]:
+    """Computes loss sampling probabilities from per-theta curvature estimates.
 
-    Curvatures are normalized over paths for each theta, averaged over theta, and
+    Curvatures are normalized over losses for each theta, averaged over theta, and
     mixed with the uniform distribution. All-zero estimates give uniform
     probabilities. Negative or non-finite estimates give NaN probabilities,
     including when called inside JIT.
 
     Args:
-        curvatures (Float[Array, "n_paths n_theta"]): Curvature estimates of shape
-            `(n_paths, n_theta)`.
+        curvatures (Float[Array, "n_losses n_theta"]): Curvature estimates of shape
+            `(n_losses, n_theta)`.
         min_prob_frac (float, optional): When using θ-IS, the minimum fraction of
-            the uniform sampling probability assigned to any path,
-            ensuring no path has zero probability of being sampled.
+            the uniform sampling probability assigned to any loss,
+            ensuring no loss has zero probability of being sampled.
             Defaults to 0.0.
         eps (float, optional): A small value for numerical stability in probability
             calculations.
             Defaults to 1e-12.
 
     Returns:
-        Float[Array, "n_paths"]: Path sampling probabilities of shape `(n_paths,)`.
+        Float[Array, "n_losses"]: Loss sampling probabilities of shape `(n_losses,)`.
 
     Raises:
         AssertionError: If `min_prob_frac` is not in [0, 1).
@@ -72,7 +72,7 @@ def theta_importance_probs(
     curvatures = jnp.asarray(curvatures)
     assert (
         curvatures.ndim == 2 and 0 not in curvatures.shape
-    ), "curvatures must have nonempty (n_paths, n_theta) shape"
+    ), "curvatures must have nonempty (n_losses, n_theta) shape"
     assert curvatures.dtype in (
         jnp.float32,
         jnp.float64,
@@ -84,7 +84,7 @@ def theta_importance_probs(
     is_valid = jnp.all(jnp.isfinite(curvatures) & (curvatures >= 0))
     # Clamp so that zero curvatures still get a small nonzero probability.
     max_curvatures = jnp.maximum(curvatures, eps)
-    # Normalize over paths for each theta.
+    # Normalize over losses for each theta.
     theta_probs = max_curvatures / max_curvatures.sum(axis=0)
     # Average over theta.
     avg_probs = theta_probs.mean(axis=1)
@@ -97,7 +97,7 @@ def theta_importance_probs(
 
 
 def load_warmup_from_dir(
-    loss: SCRAPLLoss,
+    n_losses: int,
     warmup_dir: str,
     *,
     min_prob_frac: float = 0.0,
@@ -105,28 +105,30 @@ def load_warmup_from_dir(
 ) -> ThetaISResult:
     """Loads a θ-IS warmup saved by one or more `warmup_lc_hvp` runs.
 
-    Combines the per-path results written to `warmup_dir` by runs over disjoint
-    [`start_path_idx`, `end_path_idx`) ranges and recomputes the path sampling
+    Combines the per-loss results written to `warmup_dir` by runs over disjoint
+    [`start_loss_idx`, `end_loss_idx`) ranges and recomputes the loss sampling
     probabilities from them.
 
     Args:
-        loss (SCRAPLLoss): SCRAPL loss module the warmup was run with.
+        n_losses (int): Number of losses the warmup was run with, i.e. the length of
+            the `losses` passed to `warmup_lc_hvp`.
         warmup_dir (str): Directory passed as `save_dir` to `warmup_lc_hvp`.
         min_prob_frac (float, optional): When using θ-IS, the minimum fraction of
-            the uniform sampling probability assigned to any path,
-            ensuring no path has zero probability of being sampled.
+            the uniform sampling probability assigned to any loss,
+            ensuring no loss has zero probability of being sampled.
             Defaults to 0.0.
         eps (float, optional): A small value for numerical stability in probability
             calculations.
             Defaults to 1e-12.
 
     Returns:
-        ThetaISResult: Curvature estimates, final relative residuals, and path
-        sampling probabilities for every path.
+        ThetaISResult: Curvature estimates, final relative residuals, and loss
+        sampling probabilities for every loss.
 
     Raises:
+        AssertionError: If `n_losses` is not a positive integer.
         AssertionError: If `warmup_dir` does not exist, is missing results for
-            any path, or has results for path indices >= `loss.n_paths`.
+            any loss, or has results for loss indices >= `n_losses`.
         AssertionError: If any saved curvature estimate or relative residual is not
             finite.
         AssertionError: If any saved curvature estimate is negative.
@@ -135,36 +137,40 @@ def load_warmup_from_dir(
         AssertionError: If `eps` is not finite and positive or not representable in
             the curvature dtype.
     """
+    assert (
+        isinstance(n_losses, Integral)
+        and not isinstance(n_losses, bool)
+        and n_losses > 0
+    ), "n_losses must be a positive integer"
     assert os.path.isdir(warmup_dir), f"{warmup_dir} is not a directory"
     vals_paths = [
-        os.path.join(warmup_dir, f"vals_{path_idx}.npz")
-        for path_idx in range(loss.n_paths)
+        os.path.join(warmup_dir, f"vals_{loss_idx}.npz") for loss_idx in range(n_losses)
     ]
     missing = [
-        path_idx
-        for path_idx, vals_path in enumerate(vals_paths)
+        loss_idx
+        for loss_idx, vals_path in enumerate(vals_paths)
         if not os.path.isfile(vals_path)
     ]
-    assert not missing, f"Warmup results are missing for path indices {missing}"
-    # Extra results mean the warmup was run with a loss that has more paths.
+    assert not missing, f"Warmup results are missing for loss indices {missing}"
+    # Extra results mean the warmup was run with more losses.
     extra = sorted(
         int(match.group(1))
         for name in os.listdir(warmup_dir)
         if (match := re.fullmatch(r"vals_(\d+)\.npz", name))
-        and int(match.group(1)) >= loss.n_paths
+        and int(match.group(1)) >= n_losses
     )
     assert not extra, (
-        f"Warmup results exist for path indices {extra} outside "
-        f"[0, {loss.n_paths}); the warmup was run with a different loss"
+        f"Warmup results exist for loss indices {extra} outside "
+        f"[0, {n_losses}); the warmup was run with more losses"
     )
     curvatures, relative_residuals = [], []
-    for path_idx, vals_path in enumerate(vals_paths):
+    for loss_idx, vals_path in enumerate(vals_paths):
         with np.load(vals_path) as vals:
             eigs, errors = vals["curvatures"], vals["relative_residuals"]
         assert (
             np.isfinite(eigs).all() and np.isfinite(errors).all()
-        ), f"Non-finite curvature estimates for path {path_idx}"
-        assert (eigs >= 0).all(), f"Negative curvature estimates for path {path_idx}"
+        ), f"Non-finite curvature estimates for loss {loss_idx}"
+        assert (eigs >= 0).all(), f"Negative curvature estimates for loss {loss_idx}"
         curvatures.append(eigs)
         relative_residuals.append(errors)
     assert (
@@ -466,7 +472,8 @@ def calc_largest_eig_power_iter(
         eig = optax.tree_utils.tree_vdot(tangent_norm, Hv).real
         # Compute the residual PyTree: Hv - eig * v.
         residual = jax.tree.map(lambda hv, v: hv - eig * v, Hv, tangent_norm)
-        # Relative residual normalized by ||Hv|| for comparability across theta and paths.
+        # Relative residual normalized by ||Hv|| for comparability across theta and
+        # losses.
         residual_norm = optax.tree_utils.tree_norm(residual, ord=2)
         Hv_norm = optax.tree_utils.tree_norm(Hv, ord=2)
         error = residual_norm / jnp.maximum(Hv_norm, eps)
@@ -501,28 +508,30 @@ def calc_largest_eig_power_iter(
     return eig, errors
 
 
-def calc_path_eigs(
+@eqx.filter_jit
+def calc_loss_eigs(
     enc_params: PyTree[Float[Array, "..."]],
     xs: Float[Array, "n_batches bs n_ch n_samples"],
     enc_kwargs: dict[str, Any],
     dec_kwargs: dict[str, Any],
     key: Key[Array, ""],
+    loss: eqx.Module,
     *,
-    loss: SCRAPLLoss,
     enc_fn: Callable[..., Float[Array, "bs n_theta"]],
     dec_fn: Callable[..., Float[Array, "bs n_ch n_samples"]],
-    path_idx: int,
     n_theta: int,
     n_iter: int,
     tol: float,
     eps: float,
     vmap_theta: bool,
 ) -> tuple[Float[Array, "n_theta"], Float[Array, "n_theta"]]:
-    """Estimates the θ-IS curvature of every theta for a single path.
+    """Estimates the θ-IS curvature of every theta for a single loss.
 
-    The per-path computation of `warmup_lc_hvp`, which JIT compiles it for each path
-    with the keyword-only arguments bound and `path_idx` static. Exposed so that it
-    can also be compiled and inspected on its own, e.g. for benchmarking.
+    The per-loss computation of `warmup_lc_hvp`. Compiled with `eqx.filter_jit`, so
+    the arrays, including any inside `loss`, are traced and the keyword-only
+    arguments are static. Compilations are kept for the rest of the process, so
+    repeat calls with the same `enc_fn` and `dec_fn` objects, settings, array
+    shapes, and loss structures skip compiling.
 
     Args:
         enc_params (PyTree[Float[Array, "..."]]): Floating encoder weights.
@@ -532,14 +541,14 @@ def calc_path_eigs(
             array leaves have a leading `n_batches` axis.
         dec_kwargs (dict[str, Any]): Per-batch keyword arguments for `dec_fn` whose
             array leaves have a leading `n_batches` axis.
-        key (Key[Array, ""]): JAX PRNG key of this path, from which the initial power
+        key (Key[Array, ""]): JAX PRNG key of this loss, from which the initial power
             iteration vector of each theta is derived.
-        loss (SCRAPLLoss): SCRAPL loss module.
+        loss (eqx.Module): The loss, called as `loss(x, x_target)` and
+            returning a scalar.
         enc_fn (Callable[..., Float[Array, "bs n_theta"]]): Deterministic encoder
             `enc_fn(enc_params, x, **enc_kwargs)`.
         dec_fn (Callable[..., Float[Array, "bs n_ch n_samples"]]): Deterministic
             decoder `dec_fn(theta, **dec_kwargs)`.
-        path_idx (int): Path index in `[0, loss.n_paths)`.
         n_theta (int): Number of theta output by the encoder.
         n_iter (int): Maximum number of power iteration steps per theta.
         tol (float): Stops each power iteration early once its relative residual
@@ -554,8 +563,7 @@ def calc_path_eigs(
         relative_residuals) of shape `(n_theta,)`, the curvature estimate of each
         theta and the relative residual of its final power iteration step.
     """
-    audio_loss_fn = partial(loss, path_idx=path_idx)
-    theta_loss_fn = partial(calc_loss, dec_fn=dec_fn, loss_fn=audio_loss_fn)
+    theta_loss_fn = partial(calc_loss, dec_fn=dec_fn, loss_fn=loss)
 
     def calc_theta_eig(
         theta_idx: Int[Array, ""],
@@ -580,14 +588,14 @@ def calc_path_eigs(
 
     theta_indices = jnp.arange(n_theta)
     if vmap_theta:
-        path_eigs, path_errors = jax.vmap(calc_theta_eig)(theta_indices)
+        loss_eigs, loss_errors = jax.vmap(calc_theta_eig)(theta_indices)
     else:
-        path_eigs, path_errors = jax.lax.map(calc_theta_eig, theta_indices)
-    return path_eigs, path_errors
+        loss_eigs, loss_errors = jax.lax.map(calc_theta_eig, theta_indices)
+    return loss_eigs, loss_errors
 
 
 def warmup_lc_hvp(
-    loss: SCRAPLLoss,
+    losses: list[eqx.Module],
     enc_fn: Callable[..., Float[Array, "bs n_theta"]],
     dec_fn: Callable[..., Float[Array, "bs n_ch n_samples"]],
     xs: Float[Array, "n_batches bs n_ch n_samples"],
@@ -596,8 +604,8 @@ def warmup_lc_hvp(
     dec_kwargs: dict[str, Any] | None = None,
     *,
     key: Key[Array, ""],
-    start_path_idx: int = 0,
-    end_path_idx: int | None = None,
+    start_loss_idx: int = 0,
+    end_loss_idx: int | None = None,
     save_dir: str | None = None,
     n_iter: int = 20,
     tol: float = 0.01,
@@ -605,18 +613,23 @@ def warmup_lc_hvp(
     eps: float = 1e-12,
     vmap_theta: bool = False,
 ) -> ThetaISResult:
-    """Estimates θ-IS curvatures and sampling probabilities for every path.
+    """Estimates θ-IS curvatures and sampling probabilities for every loss.
 
     Executes the θ-Importance Sampling (θ-IS) warmup procedure to
-    initialize a non-uniform scattering path sampling probability distribution
-    based on the local curvature of the loss landscape. For more information please
-    visit: https://github.com/christhetree/scrapl/tree/main/scrapl/jax#importance-sampling-warmup
+    initialize a non-uniform loss sampling probability distribution based on the
+    local curvature of the loss landscape.
+    For more information please visit:
+    https://github.com/christhetree/scrapl/tree/main/scrapl/jax#importance-sampling-warmup
 
-    Must be called outside JIT. Each path is compiled separately and batches are
-    evaluated sequentially to limit memory use. Batch curvature products are
+    Must be called outside JIT. Each loss is passed to `eqx.filter_jit` as a
+    dynamic argument, so losses that share the same static structure reuse
+    one compilation, and the rest are compiled separately. Compilations are kept
+    for the rest of the process, so repeat calls with the same `enc_fn` and `dec_fn`
+    objects, settings, array shapes, and loss structures skip compiling. Batches
+    are evaluated sequentially to limit memory use. Batch curvature products are
     summed, matching the PyTorch implementation. A finite estimate need not have
-    converged, so check `relative_residuals`. Does not modify `enc_params`, `loss`,
-    or any sampling state.
+    converged, so check `relative_residuals`. Does not modify `enc_params`,
+    `losses`, or any sampling state.
 
     Arguments that are the same for every batch, such as a sample rate, should be
     bound into `enc_fn` or `dec_fn` with a closure or `functools.partial`.
@@ -627,15 +640,19 @@ def warmup_lc_hvp(
     `jax.tree.map(lambda *a: jnp.stack(a), *kwargs_list)`.
 
     **Parallelization:** To speed up warmup, this function can be run on multiple
-    GPUs simultaneously by assigning disjoint [`start_path_idx`, `end_path_idx`)
-    ranges to each process and providing the same `key` and `save_dir`. Each path's
-    PRNG key is derived from `key` and the path index, so split runs give the same
+    GPUs simultaneously by assigning disjoint [`start_loss_idx`, `end_loss_idx`)
+    ranges to each process and providing the same `key` and `save_dir`. Each loss's
+    PRNG key is derived from `key` and the loss index, so split runs give the same
     estimates as a single run. After all processes finish, use
-    `load_warmup_from_dir` to load the aggregated path sampling probability
+    `load_warmup_from_dir` to load the aggregated loss sampling probability
     distribution.
 
     Args:
-        loss (SCRAPLLoss): SCRAPL loss module.
+        losses (list[eqx.Module]): Losses to sample from, each called as
+            `loss(x, x_target)` on waveform batches of shape
+            `(batch, channels, samples)` and returning a scalar. For a single loss
+            module taking a `path_idx` keyword, use `[eqx.Partial(loss, path_idx=i)
+            for i in range(n_paths)]` with Python int path indices.
         enc_fn (Callable[..., Float[Array, "bs n_theta"]]): Deterministic encoder
             `enc_fn(enc_params, x, **enc_kwargs)` mapping a waveform batch to
             `(batch, n_theta)`. Any non-trainable encoder state, such as the static
@@ -654,14 +671,14 @@ def warmup_lc_hvp(
             for `dec_fn`, stacked the same way as `enc_kwargs`.
             Defaults to None.
         key (Key[Array, ""]): JAX PRNG key for the initial power iteration vectors.
-        start_path_idx (int, optional): The starting index of the scattering paths
-            to compute. Used for parallelizing the warmup across multiple devices.
+        start_loss_idx (int, optional): The starting index of the losses to compute.
+            Used for parallelizing the warmup across multiple devices.
             Defaults to 0.
-        end_path_idx (int | None, optional): The ending index (exclusive) of
-            the scattering paths to compute. If None, defaults to `loss.n_paths`.
+        end_loss_idx (int | None, optional): The ending index (exclusive) of
+            the losses to compute. If None, defaults to `len(losses)`.
             Defaults to None.
         save_dir (str | None, optional): Directory path where intermediate
-            eigenvalues (`vals_{path_idx}.npz`) and the final path sampling
+            eigenvalues (`vals_{loss_idx}.npz`) and the final loss sampling
             probability distribution (`probs.npy`) will be saved. If None, nothing
             is saved.
             Defaults to None.
@@ -675,8 +692,8 @@ def warmup_lc_hvp(
             so it only stops early if all of them converge before `n_iter` steps.
             Defaults to 0.01.
         min_prob_frac (float, optional): When using θ-IS, the minimum fraction of
-            the uniform sampling probability assigned to any path,
-            ensuring no path has zero probability of being sampled.
+            the uniform sampling probability assigned to any loss,
+            ensuring no loss has zero probability of being sampled.
             Defaults to 0.0.
         eps (float, optional): A small value for numerical stability in power
             iteration and probability calculations.
@@ -687,17 +704,18 @@ def warmup_lc_hvp(
             Defaults to False.
 
     Returns:
-        ThetaISResult: Curvature estimates, final relative residuals, and path
-        sampling probabilities. Rows for paths outside [`start_path_idx`,
-        `end_path_idx`) are NaN, so the probabilities are NaN unless every path was
+        ThetaISResult: Curvature estimates, final relative residuals, and loss
+        sampling probabilities. Rows for losses outside [`start_loss_idx`,
+        `end_loss_idx`) are NaN, so the probabilities are NaN unless every loss was
         computed.
 
     Raises:
+        AssertionError: If `losses` is empty or any of its losses is not callable.
         AssertionError: If `n_iter` is not a positive integer.
         AssertionError: If `tol` is not finite and non-negative.
-        AssertionError: If [`start_path_idx`, `end_path_idx`) is not a nonempty
-            range within [0, `loss.n_paths`].
-        AssertionError: If `save_dir` already contains results for a path being
+        AssertionError: If [`start_loss_idx`, `end_loss_idx`) is not a nonempty
+            range within [0, `len(losses)`].
+        AssertionError: If `save_dir` already contains results for a loss being
             computed.
         AssertionError: If `min_prob_frac` is not in [0, 1).
         AssertionError: If `eps` is not finite and positive or not representable in
@@ -705,7 +723,7 @@ def warmup_lc_hvp(
         AssertionError: If `enc_params` contains no nonempty arrays, or any of its
             leaves are not finite float32 or float64 arrays.
         AssertionError: If `xs` is not a nonempty finite float32 or float64 array of
-            shape `(n_batches, batch, channels, samples)` with `loss.shape` samples.
+            shape `(n_batches, batch, channels, samples)`.
         AssertionError: If `enc_kwargs` or `dec_kwargs` has a leaf without a leading
             `n_batches` axis.
         AssertionError: If `enc_fn` or `dec_fn` return invalid shapes, dtypes,
@@ -713,20 +731,23 @@ def warmup_lc_hvp(
         AssertionError: If any curvature estimate or relative residual is not
             finite.
     """
+    n_losses = len(losses)
+    assert n_losses > 0, "losses must contain at least one loss"
+    assert all(callable(loss) for loss in losses), "losses must all be callable"
     assert (
         isinstance(n_iter, Integral) and not isinstance(n_iter, bool) and n_iter > 0
     ), "n_iter must be a positive integer"
     assert math.isfinite(tol) and tol >= 0, "tol must be finite and non-negative"
-    if end_path_idx is None:
-        end_path_idx = loss.n_paths
-    assert (
-        0 <= start_path_idx < end_path_idx <= loss.n_paths
-    ), (f"Path range [{start_path_idx}, {end_path_idx}) must be nonempty and within "
-        f"[0, {loss.n_paths}]")
+    if end_loss_idx is None:
+        end_loss_idx = n_losses
+    assert 0 <= start_loss_idx < end_loss_idx <= n_losses, (
+        f"Loss range [{start_loss_idx}, {end_loss_idx}) must be nonempty and within "
+        f"[0, {n_losses}]"
+    )
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
-        for path_idx in range(start_path_idx, end_path_idx):
-            save_path = os.path.join(save_dir, f"vals_{path_idx}.npz")
+        for loss_idx in range(start_loss_idx, end_loss_idx):
+            save_path = os.path.join(save_dir, f"vals_{loss_idx}.npz")
             assert not os.path.isfile(save_path), f"{save_path} already exists"
     assert 0 <= min_prob_frac < 1, "min_prob_frac must be in [0, 1)"
     assert math.isfinite(eps) and eps > 0, "eps must be finite and positive"
@@ -750,11 +771,8 @@ def warmup_lc_hvp(
 
     xs = jnp.asarray(xs)
     assert (
-        xs.ndim == 4 and 0 not in xs.shape and xs.shape[-1] == loss.shape
-    ), (
-        f"xs must have nonempty (n_batches, batch, channels, samples) shape with "
-        f"{loss.shape} samples"
-    )
+        xs.ndim == 4 and 0 not in xs.shape
+    ), "xs must have nonempty (n_batches, batch, channels, samples) shape"
     assert xs.dtype in (jnp.float32, jnp.float64), "xs must use float32 or float64"
     assert np.isfinite(np.asarray(xs)).all(), "xs must be finite"
 
@@ -791,15 +809,26 @@ def warmup_lc_hvp(
     # silently clamped.
     n_theta = theta.shape[1]
     log.info(
-        f"Starting warmup_lc_hvp for paths [{start_path_idx}, {end_path_idx}) of "
-        f"{loss.n_paths}, {n_theta} theta, "
+        f"Starting warmup_lc_hvp for losses [{start_loss_idx}, {end_loss_idx}) of "
+        f"{n_losses}, {n_theta} theta, "
         f"{xs.shape[0]} batch(es), {n_iter} iter, tol = {tol} (vmap_theta = {vmap_theta})"
     )
 
-    compiled = jax.jit(
-        partial(
-            calc_path_eigs,
-            loss=loss,
+    # Losses outside [start_loss_idx, end_loss_idx) stay NaN.
+    curvatures = np.full((n_losses, n_theta), np.nan, dtype=theta.dtype)
+    relative_residuals = np.full((n_losses, n_theta), np.nan, dtype=theta.dtype)
+    loss_indices = range(start_loss_idx, end_loss_idx)
+    for loss_idx in tqdm(loss_indices, desc="Theta-IS warmup", unit="loss"):
+        key_loss = jax.random.fold_in(key, loss_idx)
+        # Arrays, including any inside the loss, are traced. The keyword arguments
+        # are static, so they and the loss's static structure select the compilation.
+        eigs, errors = calc_loss_eigs(
+            enc_params,
+            xs,
+            enc_kwargs,
+            dec_kwargs,
+            key_loss,
+            losses[loss_idx],
             enc_fn=enc_fn,
             dec_fn=dec_fn,
             n_theta=n_theta,
@@ -807,39 +836,28 @@ def warmup_lc_hvp(
             tol=tol,
             eps=eps,
             vmap_theta=vmap_theta,
-        ),
-        static_argnames=("path_idx",),
-    )
-    # Paths outside [start_path_idx, end_path_idx) stay NaN.
-    curvatures = np.full((loss.n_paths, n_theta), np.nan, dtype=theta.dtype)
-    relative_residuals = np.full((loss.n_paths, n_theta), np.nan, dtype=theta.dtype)
-    path_indices = range(start_path_idx, end_path_idx)
-    for path_idx in tqdm(path_indices, desc="Theta-IS warmup", unit="path"):
-        key_path = jax.random.fold_in(key, path_idx)
-        eigs, errors = compiled(
-            enc_params, xs, enc_kwargs, dec_kwargs, key_path, path_idx=path_idx
         )
         eigs, errors = np.asarray(eigs), np.asarray(errors)
         assert (
             np.isfinite(eigs).all() and np.isfinite(errors).all()
-        ), f"Non-finite curvature estimates for path {path_idx}"
-        curvatures[path_idx] = eigs
-        relative_residuals[path_idx] = errors
+        ), f"Non-finite curvature estimates for loss {loss_idx}"
+        curvatures[loss_idx] = eigs
+        relative_residuals[loss_idx] = errors
         # Save intermediate results for parallel computation
         if save_dir is not None:
             # Write to a temporary file and rename it so that an interrupted run
             # never leaves a partial file behind.
-            save_path = os.path.join(save_dir, f"vals_{path_idx}.npz")
+            save_path = os.path.join(save_dir, f"vals_{loss_idx}.npz")
             tmp_path = f"{save_path}.tmp"
             with open(tmp_path, "wb") as f:
                 np.savez(f, curvatures=eigs, relative_residuals=errors)
             os.replace(tmp_path, save_path)
-        log.debug(f"Theta-IS warmup: path {path_idx + 1}/{loss.n_paths} complete")
+        log.debug(f"Theta-IS warmup: loss {loss_idx + 1}/{n_losses} complete")
     curvatures = jnp.asarray(curvatures)
     relative_residuals = jnp.asarray(relative_residuals)
     probs = theta_importance_probs(curvatures, min_prob_frac=min_prob_frac, eps=eps)
-    # Only save the final probs if every path was computed
-    if save_dir is not None and start_path_idx == 0 and end_path_idx == loss.n_paths:
+    # Only save the final probs if every loss was computed
+    if save_dir is not None and start_loss_idx == 0 and end_loss_idx == n_losses:
         probs_path = os.path.join(save_dir, "probs.npy")
         log.info(
             f"Saving theta-IS warmup probabilities to {os.path.abspath(probs_path)}"

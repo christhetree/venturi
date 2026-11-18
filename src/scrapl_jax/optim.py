@@ -129,7 +129,7 @@ def p_adam(
     to normalize gradients across stochastic path choices.
 
     Args:
-        n_paths (int): Total number of scattering paths (i.e. `SCRAPLLoss.n_paths`).
+        n_paths (int): Total number of paths (i.e. `len(losses)` in `warmup_lc_hvp`).
         b1 (float, optional): β1 Adam hyperparameter for the internal
             𝒫-Adam algorithm.
             Defaults to 0.9.
@@ -268,7 +268,7 @@ def p_saga(n_paths: int) -> optax.GradientTransformationExtraArgs:
     gradient corrections.
 
     Args:
-        n_paths (int): Total number of scattering paths (i.e. `SCRAPLLoss.n_paths`).
+        n_paths (int): Total number of paths (i.e. `len(losses)` in `warmup_lc_hvp`).
 
     Returns:
         optax.GradientTransformationExtraArgs: An Optax gradient transformation
@@ -389,7 +389,7 @@ def scrapl_optimizer(
         weight_decay (float, optional): L2 weight decay factor added to updates
             before learning rate scaling.
             Defaults to 0.01.
-        n_paths (int): Total number of scattering paths (i.e. `SCRAPLLoss.n_paths`).
+        n_paths (int): Total number of paths (i.e. `len(losses)` in `warmup_lc_hvp`).
         grad_mult (float, optional): A scalar multiplier applied to gradients to
             prevent JTFS precision errors when squaring gradient values in commonly
             used optimizers like Adam. See https://hal.science/hal-05124224v1 for

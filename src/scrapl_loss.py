@@ -18,6 +18,7 @@ from torch.nn import Parameter
 
 import hessian_eigenthings
 from hessian_eigenthings.operator import LambdaOperator
+from scrapl_jax import warmup as scrapl_warmup
 
 logging.basicConfig()
 log = logging.getLogger(__name__)
@@ -436,6 +437,16 @@ class DecoderJAX(eqx.Module):
         return x
 
 
+class MSELossJAX(eqx.Module):
+    def __call__(
+        self,
+        x: Float[Array, "bs n_ch n_samples"],
+        x_target: Float[Array, "bs n_ch n_samples"],
+    ) -> Float[Array, ""]:
+        loss = jnp.mean((x - x_target) ** 2)
+        return loss
+
+
 def tree_l2_normalize(
     tree: PyTree[Float[Array, "..."]], eps: float
 ) -> PyTree[Float[Array, "..."]]:
@@ -681,8 +692,46 @@ if __name__ == "__main__":
     final_mem = get_cpu_memory_mb()
     log.info(f"Memory increase: {final_mem - initial_mem:.2f} MB")
 
+    # Test scrapl_jax warmup_lc_hvp ====================================================
+    # scrapl_jax expects (batch, channels, samples) waveforms, so add a channel axis
+    enc_w_jax, enc_static_jax = eqx.partition(encoder_jax, eqx.is_array)
+
+    def enc_fn_scrapl(
+        w: PyTree[Float[Array, "..."]], x: Float[Array, "bs 1 n_samples"]
+    ) -> Float[Array, "bs n_theta"]:
+        curr_encoder = eqx.combine(w, enc_static_jax)
+        theta = jax.vmap(curr_encoder)(x[:, 0, :])
+        return theta
+
+    def dec_fn_scrapl(
+        theta: Float[Array, "bs n_theta"],
+    ) -> Float[Array, "bs 1 n_samples"]:
+        x_hat = jax.vmap(decoder_jax)(theta)
+        return x_hat[:, None, :]
+
+    start_time = time.perf_counter()
+    # A single loss gives a single path. tol = 0.0 runs all n_iter power iteration
+    # steps, matching the other two implementations, and vmap_theta = True evaluates
+    # theta in parallel like warmup_lc_hvp_jax.
+    warmup_scrapl = scrapl_warmup.warmup_lc_hvp(
+        losses=[MSELossJAX()],
+        enc_fn=enc_fn_scrapl,
+        dec_fn=dec_fn_scrapl,
+        xs=xs_jax[:, :, None, :],
+        enc_params=enc_w_jax,
+        key=hvp_key,
+        n_iter=20,
+        tol=0.0,
+        vmap_theta=True,
+    )
+    end_time = time.perf_counter()
+    elapsed_time = end_time - start_time
+    log.info(f"scrapl_jax warmup_lc_hvp took {elapsed_time:.4f} seconds")
+    vals_scrapl = warmup_scrapl.curvatures[0]
+
     print("\n--- Eigenvalue Comparison ---")
-    print("PyTorch Vals:", vals.detach().numpy())
-    print("JAX Vals:    ", vals_jax)
+    print("PyTorch Vals:   ", vals.detach().numpy())
+    print("JAX Vals:       ", vals_jax)
+    print("scrapl_jax Vals:", vals_scrapl)
     # print("\n--- JAX Power Iteration Errors ---")
     # print(errors_jax)

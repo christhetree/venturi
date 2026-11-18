@@ -1,8 +1,3 @@
-from .._dependencies import require_backend
-
-require_backend("jax")
-
-from .loss import SCRAPLLoss
 from .optim import (
     PAdamState,
     PSAGAState,
@@ -21,7 +16,6 @@ from .warmup import (
 )
 
 __all__ = [
-    "SCRAPLLoss",
     "PAdamState",
     "PSAGAState",
     "ThetaISResult",
