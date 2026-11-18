@@ -1,0 +1,14 @@
+# JAX version of spectral_2dcnn_14p.yml (same init_args). The PRNG key for the weight
+# initialization is derived from the run seed by the trainer.
+class_path: src.models_jax.Spectral2DCNN
+init_args:
+  n_bins: 108
+  n_frames: 173
+  in_ch: 1
+  kernel_size: [3, 3]
+  out_channels: [128, 128, 128, 128, 128]
+  pool_sizes: [[2, 2], [2, 2], [2, 3], [3, 3], [3, 3]]
+  latent_dim: 128
+  use_ln: true
+  dropout_prob: 0.25
+  n_params: 14
