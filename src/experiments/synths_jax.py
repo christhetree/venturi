@@ -48,9 +48,12 @@ def sinusoidal_oscillator(
     f0 = 2 * jnp.pi * freq_hz / sr
     freq_env = jnp.ones_like(mod_env) * f0
     freq_env = freq_env + mod_env * mod_amount * f0
-    # Prepend a zero so the phase starts at 0, then integrate
+    # Prepend a zero so the phase starts at 0, then integrate. With a parallel
+    # `associative_scan` rather than `jnp.cumsum`, which JAX lowers to an O(n^2)
+    # `reduce_window` that XLA has to rewrite (fine on CPU, possibly slow on GPU for
+    # n = 44100); both have the same float32 accuracy here
     freq_env = jnp.concatenate([jnp.zeros_like(freq_env[:, :1]), freq_env], axis=-1)
-    phase = jnp.cumsum(freq_env, axis=-1)[:, :-1]
+    phase = jax.lax.associative_scan(jnp.add, freq_env, axis=-1)[:, :-1]
     return jnp.sin(phase)
 
 

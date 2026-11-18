@@ -7,6 +7,7 @@ XLA_FLAGS=--xla_gpu_deterministic_ops=false python scripts/bench_jax.py
 import os
 import sys
 import time
+from functools import partial
 
 sys.path.insert(0, os.path.abspath(os.path.join(__file__, "../../")))
 
@@ -20,7 +21,12 @@ import equinox as eqx  # noqa: E402
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 
-from src.experiments.synths_jax import biquad_scan, highpass_coefficients  # noqa
+from src.experiments.synths_jax import (  # noqa: E402
+    biquad_scan,
+    exp_decay_envelope,
+    highpass_coefficients,
+    time_shift,
+)
 from src.experiments.trainer_jax import (  # noqa: E402
     make_optimizer,
     make_train_step,
@@ -81,9 +87,20 @@ bench("model fwd+bwd", model_grad, model, U, key)
 bench(f"synth fwd+bwd (scan_unroll={loss.synth.scan_unroll})", synth_grad, theta, loss.synth, delta)  # fmt: skip
 bench(f"audio loss fwd+bwd ({type(loss.loss_func).__name__})", audio_loss_grad, x_hat, loss.loss_func, x_target)  # fmt: skip
 
-# The synth's noise filter alone (forward + backward), for several `unroll`
-u = jax.random.uniform(key, x[:, 0].shape, minval=-1.0, maxval=1.0)
+# The parts of the synth (forward + backward)
+n = x.shape[-1]
+u = jax.random.uniform(key, (bs, n), minval=-1.0, maxval=1.0)
+fe = jax.random.uniform(key, (bs, n + 1), maxval=0.3)  # Phase increments
+decay_ms = jnp.full((bs, 1), 500.0)
 b, a = highpass_coefficients(jnp.full((bs, 1), 200.0), jnp.full((bs, 1), 0.7), 44100)
+scan_add = partial(jax.lax.associative_scan, jnp.add, axis=-1)
+for name, cumsum in [("jnp.cumsum", partial(jnp.cumsum, axis=-1)), ("associative_scan", scan_add)]:  # fmt: skip
+    f = jax.jit(jax.grad(lambda fe_: jnp.sin(cumsum(fe_)).sum()))
+    bench(f"  oscillator phase, {name} (x2)", f, fe)
+f = jax.jit(jax.grad(lambda d: exp_decay_envelope(d, 44100, n).sum()))
+bench("  decay envelope (x4)", f, decay_ms)
+f = jax.jit(jax.grad(lambda u_: time_shift(u_, delta, -2048).sum()))
+bench("  time_shift", f, u)
 for unroll in [1, 16, 128]:
-    f = jax.jit(jax.grad(lambda u_: biquad_scan(u_, b, a, unroll).sum()))
-    bench(f"  biquad scan fwd+bwd, unroll={unroll}", f, u)
+    f = jax.jit(jax.grad(lambda u_, b_, a_: biquad_scan(u_, b_, a_, unroll).sum(), argnums=(0, 1, 2)))  # fmt: skip
+    bench(f"  noise biquad scan, unroll={unroll}", f, u, b, a)
