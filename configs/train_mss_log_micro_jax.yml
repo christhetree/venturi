@@ -1,4 +1,4 @@
-# JAX version of train_mss_log_micro.yml, for scripts/train_jax.py
+# JAX version of train_mss_log_micro.yml, for scripts/train.py
 seed_everything: 420
 
 custom:
@@ -13,13 +13,13 @@ trainer:
   max_epochs: 50
   accumulate_grad_batches: 1
   log_every_n_steps: 50           # how often training losses are copied to the host
-  compilation_cache_dir: out/jax_cache  # relative to the experiments directory
+  compilation_cache_dir: out/jax_cache  # relative to the repository root
 
 data:
-  class_path: eval_808.data_jax.WavDataModule
+  class_path: src.experiments.data_jax.WavDataModule
   init_args:
     batch_size: 8
-    root_dir: data/808_dataset
+    root_dir: data/808_dataset  # relative to the repository root
     sr: 44100
     n_samples: 44100
     n_train: 425
@@ -36,14 +36,14 @@ model: spectral_2dcnn_14p_jax.yml
 # The fixed parts of the objective (the model.init_args of the PyTorch config, minus
 # the model): called as loss(model, x, delta, key=key)
 loss:
-  class_path: eval_808.loss_jax.DDSP808Loss
+  class_path: src.experiments.losses_jax.DDSP808Loss
   init_args:
     synth: synth_jax.yml
-    loss_func: ../losses/mss_meso_log_jax.yml
+    loss_func: mss_meso_log_jax.yml  # or mss_revisited_jax.yml
     feature_type: cqt
     cqt_eps: 1e-3
 
-optimizer: ../opt/adam_w_1e-4_jax.yml
+optimizer: adam_w_1e-4_jax.yml
 
 # torch.optim.lr_scheduler.LinearLR, stepped once per epoch like in Lightning
 lr_scheduler:

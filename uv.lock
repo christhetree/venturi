@@ -2632,12 +2632,15 @@ dependencies = [
     { name = "pandas" },
     { name = "pip-chill" },
     { name = "psutil" },
+    { name = "pyyaml" },
     { name = "scipy" },
+    { name = "soundfile" },
     { name = "tensorboard" },
     { name = "torch" },
     { name = "torchaudio" },
     { name = "torchcodec" },
     { name = "torchvision" },
+    { name = "tqdm" },
     { name = "wandb" },
 ]
 
@@ -2658,12 +2661,15 @@ requires-dist = [
     { name = "pandas", specifier = ">=3.0.1" },
     { name = "pip-chill", specifier = ">=1.0.3" },
     { name = "psutil", specifier = ">=7.2.2" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "scipy", specifier = ">=1.17.0" },
+    { name = "soundfile", specifier = ">=0.14.0" },
     { name = "tensorboard", specifier = ">=2.20.0" },
     { name = "torch", specifier = ">=2.10.0" },
     { name = "torchaudio", specifier = ">=2.10.0" },
     { name = "torchcodec", specifier = ">=0.10.0" },
     { name = "torchvision", specifier = ">=0.25.0" },
+    { name = "tqdm", specifier = ">=4.70.1" },
     { name = "wandb", specifier = ">=0.25.0" },
 ]
 

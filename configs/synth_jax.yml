@@ -1,6 +1,6 @@
 # JAX version of synth.yml (same init_args). The PRNG key for the noise buffer is
 # derived from the run seed by the trainer.
-class_path: eval_808.synths_jax.DDSP808Synth
+class_path: src.experiments.synths_jax.DDSP808Synth
 init_args:
   sr: 44100
   num_samples: 44100

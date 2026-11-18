@@ -15,12 +15,12 @@ from collections.abc import Iterator
 import numpy as np
 import soundfile
 
+# Relative paths (e.g. `root_dir`) are relative to the repository root
+from src.paths import ROOT_DIR
+
 logging.basicConfig()
 log = logging.getLogger(__name__)
 log.setLevel(level=os.environ.get("LOGLEVEL", "INFO"))
-
-# Relative paths are relative to the experiments directory
-ROOT_DIR = os.path.abspath(os.path.join(__file__, "../../"))
 
 Batch = tuple[np.ndarray, list[str], np.ndarray]
 

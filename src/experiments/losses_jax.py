@@ -1,0 +1,299 @@
+"""
+JAX equivalents of the LogMSSLoss class in losses.py and of
+auraloss.freq.MultiResolutionSTFTLoss, using korvax for the STFT. Kept separate from
+losses.py so that they can be imported without PyTorch.
+
+Also `DDSP808Loss`, the training objective of the 808 experiments, which uses one of
+these losses on the synthesized audio.
+"""
+
+import logging
+import os
+from collections.abc import Callable
+from typing import List, Optional, Sequence
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import korvax
+from jaxtyping import Array, Complex, Float, Int, Key
+from korvax.loss import elementwise_loss
+
+from src.experiments.cqt_jax import CQT, calc_cqt
+from src.experiments.synths_jax import DDSP808Synth
+from src.scrapl_jax import safe_lp_norm
+
+logging.basicConfig()
+log = logging.getLogger(__name__)
+log.setLevel(level=os.environ.get("LOGLEVEL", "INFO"))
+
+
+def _flat_lp_norm(x: Float[Array, "..."], p: float, n_dims: int) -> Float[Array, "..."]:
+    """
+    Lp norm over the last `n_dims` axes treated as one flattened vector (like
+    torch.linalg.vector_norm with a tuple of dims). jnp.linalg.norm with a tuple of
+    axes computes a matrix norm instead, so it cannot be used here.
+    """
+    x = x.reshape(x.shape[:-n_dims] + (-1,))
+    return safe_lp_norm(x, p=p, axis=-1)
+
+
+def _stft(
+    x: Float[Array, "... n_samples"],
+    n_fft: int,
+    hop_length: int,
+    win_length: int,
+    window: str,
+) -> Complex[Array, "... n_bins n_frames"]:
+    """
+    STFT computed with korvax and centered like torch.stft(center=True), i.e. reflect
+    padded by n_fft // 2 on both sides. korvax's own centering pads with zeros instead,
+    and with one more sample on the right when n_fft is odd. Windows are periodic.
+    """
+    pad = n_fft // 2
+    x = jnp.pad(x, [(0, 0)] * (x.ndim - 1) + [(pad, pad)], mode="reflect")
+    return korvax.stft(
+        x,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window=window,
+        center=False,
+    )
+
+
+class MultiResolutionSTFTLoss(eqx.Module):
+    """
+    auraloss.freq.MultiResolutionSTFTLoss in JAX, using korvax. Only the log and
+    linear magnitude terms are implemented (no spectral convergence, phase,
+    perceptual weighting, or frequency scale), which is all the mss_meso_log config
+    uses. Like auraloss, the magnitudes are sqrt(max(|STFT|^2, eps)), and the loss is
+    averaged over the resolutions. korvax.loss.mrstft_loss is not used since it
+    computes magnitudes and pads the signal differently. An Equinox module with only
+    static (configuration) fields, so it can be a field of other modules.
+    """
+
+    fft_sizes: tuple[int, ...] = eqx.field(static=True)
+    hop_sizes: tuple[int, ...] = eqx.field(static=True)
+    win_lengths: tuple[int, ...] = eqx.field(static=True)
+    w_log_mag: float = eqx.field(static=True)
+    w_lin_mag: float = eqx.field(static=True)
+    eps: float = eqx.field(static=True)
+    mag_distance: str = eqx.field(static=True)
+
+    def __init__(
+        self,
+        fft_sizes: Sequence[int],
+        hop_sizes: Sequence[int],
+        win_lengths: Sequence[int],
+        window: str = "hann_window",
+        w_sc: float = 0.0,
+        w_log_mag: float = 1.0,
+        w_lin_mag: float = 0.0,
+        w_phs: float = 0.0,
+        eps: float = 1e-8,
+        mag_distance: str = "L1",
+    ):
+        assert len(fft_sizes) == len(hop_sizes) == len(win_lengths)
+        assert w_sc == 0.0, "The spectral convergence term is not implemented"
+        assert w_phs == 0.0, "The phase term is not implemented"
+        assert window == "hann_window", "Only the hann_window window is implemented"
+        assert mag_distance in ["L1", "L2"]
+        # Tuples, since static fields must be hashable
+        self.fft_sizes = tuple(fft_sizes)
+        self.hop_sizes = tuple(hop_sizes)
+        self.win_lengths = tuple(win_lengths)
+        self.w_log_mag = w_log_mag
+        self.w_lin_mag = w_lin_mag
+        self.eps = eps
+        self.mag_distance = mag_distance
+
+    def __call__(
+        self,
+        x: Float[Array, "bs n_ch n_samples"],
+        x_target: Float[Array, "bs n_ch n_samples"],
+    ) -> Float[Array, ""]:
+        assert x.ndim == x_target.ndim == 3
+        loss = 0.0
+        for fft_size, hop_size, win_length in zip(
+            self.fft_sizes, self.hop_sizes, self.win_lengths
+        ):
+            mags = []
+            for audio in [x, x_target]:
+                X = _stft(audio, fft_size, hop_size, win_length, "hann")
+                power = jnp.real(X) ** 2 + jnp.imag(X) ** 2
+                mags.append(jnp.sqrt(jnp.maximum(power, self.eps)))
+            x_mag, x_target_mag = mags
+            if self.w_log_mag:
+                log_mag_loss = elementwise_loss(
+                    jnp.log(x_mag), jnp.log(x_target_mag), metric=self.mag_distance
+                )
+                loss += self.w_log_mag * log_mag_loss
+            if self.w_lin_mag:
+                lin_mag_loss = elementwise_loss(
+                    x_mag, x_target_mag, metric=self.mag_distance
+                )
+                loss += self.w_lin_mag * lin_mag_loss
+        loss /= len(self.fft_sizes)
+        return loss
+
+
+class LogMSSLoss:
+    """
+    LogMSSLoss of losses.py in JAX, using korvax for the STFTs. korvax's
+    smooth_mrstft_loss is not used since it computes the mean squared error
+    averaged over resolutions (instead of the Lp norm summed over resolutions), and
+    its first hop size is 32 instead of 33.
+    """
+
+    # The scipy.signal.get_window names of the window types of losses.py
+    WINDOWS = {"rect": "boxcar", "hann": "hann", "flat_top": "flattop"}
+
+    def __init__(
+        self,
+        fft_sizes: Optional[List[int]] = None,
+        hop_sizes: Optional[List[int]] = None,
+        win_lengths: Optional[List[int]] = None,
+        window: str = "flat_top",
+        log_mag_eps: float = 1.0,
+        gamma: float = 1.0,
+        p: int = 2,
+    ):
+        assert window in self.WINDOWS, f"Unknown window type: {window}"
+        if win_lengths is None:
+            win_lengths = [67, 127, 257, 509, 1021, 2053]
+            log.info(f"win_lengths = {win_lengths}")
+        if fft_sizes is None:
+            fft_sizes = win_lengths
+            log.info(f"fft_sizes = {fft_sizes}")
+        if hop_sizes is None:
+            hop_sizes = [w // 2 for w in win_lengths]
+            log.info(f"hop_sizes = {hop_sizes}")
+        self.fft_sizes = fft_sizes
+        self.hop_sizes = hop_sizes
+        self.win_lengths = win_lengths
+        self.window = self.WINDOWS[window]
+        self.log_mag_eps = log_mag_eps
+        self.gamma = gamma
+        self.p = p
+
+    def __call__(
+        self,
+        x: Float[Array, "bs n_ch n_samples"],
+        x_target: Float[Array, "bs n_ch n_samples"],
+    ) -> Float[Array, ""]:
+        assert x.ndim == x_target.ndim == 3
+        assert x.shape[1] == x_target.shape[1] == 1
+        x = x[:, 0, :]
+        x_target = x_target[:, 0, :]
+        dists = []
+        for fft_size, hop_size, win_length in zip(
+            self.fft_sizes, self.hop_sizes, self.win_lengths
+        ):
+            log_mags = []
+            for audio in [x, x_target]:
+                S = jnp.abs(_stft(audio, fft_size, hop_size, win_length, self.window))
+                if self.log_mag_eps == 1.0:
+                    log_mags.append(jnp.log1p(self.gamma * S))
+                else:
+                    log_mags.append(jnp.log(self.gamma * S + self.log_mag_eps))
+            log_Sx, log_Sx_target = log_mags
+            dist = _flat_lp_norm(log_Sx_target - log_Sx, p=self.p, n_dims=2)
+            dists.append(dist)
+        dist = jnp.stack(dists, axis=1).sum(axis=1)
+        dist = dist.mean()  # Aggregate the batch dimension
+        return dist
+
+
+class DDSP808Loss(eqx.Module):
+    """
+    The training objective of `DDSP808LightingModule` (`lightning.py`) in JAX: the CQT
+    of the target audio goes into the model, which predicts the synth parameters, and
+    the loss compares the synthesized audio with the target.
+
+    Holds only the fixed parts (synth, CQT, audio loss); the trainable model is passed
+    in on every call, so training state is just `(model, opt_state)`:
+
+        loss = DDSP808Loss(synth, MultiResolutionSTFTLoss(...))
+        (value, aux), grads = eqx.filter_value_and_grad(loss, has_aux=True)(
+            model, x, delta, key=key
+        )
+    """
+
+    synth: DDSP808Synth
+    cqt: CQT
+    loss_func: Callable[..., Float[Array, ""]]
+    cqt_eps: float = eqx.field(static=True)
+
+    def __init__(
+        self,
+        synth: DDSP808Synth,
+        loss_func: Callable[..., Float[Array, ""]],
+        feature_type: str = "cqt",
+        cqt_eps: float = 1e-3,
+    ) -> None:
+        """
+        Args:
+            synth: The `DDSP808Synth`.
+            loss_func: Maps `(x_hat, x)`, both `(bs, 1, n_samples)`, to a scalar
+                (e.g. `MultiResolutionSTFTLoss` or `LogMSSLoss`).
+            feature_type: Only "cqt" is supported, as in `lightning.py`.
+            cqt_eps: Scale of the log compression of the CQT.
+        """
+        if feature_type != "cqt":
+            raise NotImplementedError(f"Unsupported feature_type: {feature_type}")
+        self.synth = synth
+        self.loss_func = loss_func
+        self.cqt_eps = cqt_eps
+        # Same CQT settings as `DDSP808LightingModule`
+        self.cqt = CQT(
+            sr=synth.sr,
+            hop_length=synth.hop_len,
+            fmin=(0.4 * synth.sr) / (2**synth.J_cqt),
+            n_bins=synth.J_cqt * synth.Q_cqt,
+            bins_per_octave=synth.Q_cqt,
+        )
+
+    def prepare_target(
+        self, x: Float[Array, "bs 1 n_samples"]
+    ) -> Float[Array, "bs 1 n_samples"]:
+        """Delays the target by the padding the synth adds when `delta_min < 0`."""
+        n_padding = -self.synth.delta_min
+        if n_padding > 0:
+            x = jnp.pad(x, ((0, 0), (0, 0), (n_padding, 0)))
+            x = x[:, :, : self.synth.num_samples]
+        return x
+
+    def calc_U(
+        self, x: Float[Array, "bs 1 n_samples"]
+    ) -> Float[Array, "bs n_bins n_frames"]:
+        return jax.vmap(lambda x_: calc_cqt(x_, self.cqt, self.cqt_eps))(x[:, 0, :])
+
+    def __call__(
+        self,
+        model: eqx.Module,
+        x: Float[Array, "bs 1 n_samples"],
+        delta: Int[Array, "bs"] | None = None,
+        *,
+        key: Key[Array, ""] | None = None,
+    ) -> tuple[Float[Array, ""], dict[str, Array]]:
+        """Computes the loss of `model` on a batch of target audio.
+
+        Args:
+            model: Maps a log-CQT of shape `(n_bins, n_frames)` to `(n_params,)` synth
+                parameters in [0, 1] (e.g. `Spectral2DCNN`); vmapped over the batch.
+            x: Target audio, as loaded (before the delay of `prepare_target`).
+            delta: Time shifts for the synth. Use None for validation and testing.
+            key: PRNG key for dropout. Not needed with `eqx.nn.inference_mode(model)`.
+
+        Returns:
+            The loss and a dict with the delayed target `x`, the synthesized `x_hat`,
+            and the predicted parameters `theta_hat`.
+        """
+        x = self.prepare_target(x)
+        U = jax.lax.stop_gradient(self.calc_U(x))
+        keys = None if key is None else jax.random.split(key, x.shape[0])
+        theta_hat = jax.vmap(model)(U, key=keys)
+        x_hat = self.synth(theta_hat, delta)
+        loss = self.loss_func(x_hat, x)
+        return loss, {"x": x, "x_hat": x_hat, "theta_hat": theta_hat}

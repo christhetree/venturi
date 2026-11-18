@@ -1,5 +1,5 @@
-# JAX version of mss_meso_log.yml (same init_args), from ../scripts/losses_jax.py
-class_path: losses_jax.MultiResolutionSTFTLoss
+# JAX version of mss_meso_log.yml (same init_args)
+class_path: src.experiments.losses_jax.MultiResolutionSTFTLoss
 init_args:
   fft_sizes:
     - 64

@@ -1,0 +1,84 @@
+"""
+Trains with the JAX trainer (`src/experiments/trainer_jax.py`). Run from the
+repository root, e.g.:
+
+    python scripts/train.py -c train_mss_log_micro_jax.yml
+    python scripts/train.py -c train_mss_log_micro_jax.yml --seeds 0 1 2
+    python scripts/train.py -c train_mss_log_micro_jax.yml \
+        --set trainer.max_epochs=2 data.init_args.n_train=32
+    python scripts/train.py -c train_mss_log_micro_jax.yml --stages test
+
+Without `--seeds`, a single run uses the config's `seed_everything`. With `--seeds`,
+like the PyTorch `scripts/train.py` for the 808 experiments, each seed also sets the
+data `shuffle_seed`, so every seed uses a different train / val / test split.
+
+`--stages` runs `fit` (training) and / or `test` (of the best checkpoint of a
+previous `fit` with the same config and seed); both by default.
+"""
+
+import argparse
+import logging
+import os
+import sys
+
+import yaml
+
+# So that `src` (and the `class_path`s of the configs) can be imported
+sys.path.insert(0, os.path.abspath(os.path.join(__file__, "../../")))
+
+from src.experiments.util import (  # noqa: E402
+    YamlLoader,
+    load_config,
+    set_config_value,
+    setup_env,
+)
+from src.paths import CONFIGS_DIR  # noqa: E402
+
+logging.basicConfig()
+log = logging.getLogger(__name__)
+log.setLevel(level=os.environ.get("LOGLEVEL", "INFO"))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "-c", "--config", required=True, help="Path, absolute or in configs/"
+    )
+    parser.add_argument("--seeds", type=int, nargs="+", default=None)
+    parser.add_argument(
+        "--stages", nargs="+", choices=["fit", "test"], default=["fit", "test"]
+    )
+    parser.add_argument(
+        "--set",
+        nargs="+",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Overrides, e.g. trainer.max_epochs=2",
+    )
+    args = parser.parse_args()
+
+    config_path = args.config
+    if not os.path.isfile(config_path):
+        config_path = os.path.join(CONFIGS_DIR, config_path)
+    config = load_config(config_path)
+    for override in args.set:
+        k, v = override.split("=", 1)
+        set_config_value(config, k, yaml.load(v, Loader=YamlLoader))
+    setup_env(config)
+
+    # Imports JAX, so only after `setup_env`
+    from src.experiments.trainer_jax import fit, test
+
+    log.info(f"Running {' and '.join(args.stages)} with config: {config_path}")
+    seeds = args.seeds
+    if seeds is None:
+        seeds = [config.get("seed_everything", 0)]
+    else:
+        log.info(f"Running with seeds: {seeds}")
+    for seed in seeds:
+        if args.seeds is not None:
+            set_config_value(config, "data.init_args.shuffle_seed", seed)
+        if "fit" in args.stages:
+            fit(config, seed=seed)
+        if "test" in args.stages:
+            test(config, seed=seed)

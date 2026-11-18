@@ -1,35 +1,26 @@
 """
-Trains with the JAX trainer (`src/trainer_jax.py`), the JAX counterpart of
-`scripts/train.py`. Run from the experiments directory, e.g.:
+Config utilities for the JAX experiments: loading the YAML configs, overriding their
+values, setting up JAX's environment from them, and instantiating their
+`{class_path, init_args}` nodes.
 
-    python scripts/train_jax.py -c eval_808/train_mss_log_micro_jax.yml
-    python scripts/train_jax.py -c eval_808/train_mss_log_micro_jax.yml --seeds 0 1 2
-    python scripts/train_jax.py -c eval_808/train_mss_log_micro_jax.yml \
-        --set trainer.max_epochs=2 data.init_args.n_train=32
-    python scripts/train_jax.py -c eval_808/train_mss_log_micro_jax.yml --stages test
-
-Without `--seeds`, a single run uses the config's `seed_everything`. With `--seeds`,
-like `scripts/train.py` for the 808 experiments, each seed also sets the data
-`shuffle_seed`, so every seed uses a different train / val / test split.
-
-`--stages` runs `fit` (training) and / or `test` (of the best checkpoint of a
-previous `fit` with the same config and seed); both by default.
+This module does not import JAX at the top level, since `setup_env` sets environment
+variables that JAX reads when it is imported.
 """
 
-import argparse
+import importlib
+import inspect
 import logging
 import os
 import re
-import sys
-from typing import Any
+import zlib
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
-EXPERIMENTS_DIR = os.path.abspath(os.path.join(__file__, "../../"))
-CONFIGS_DIR = os.path.join(EXPERIMENTS_DIR, "configs")
-# For `src` / `eval_808`, and for `losses_jax` (the JAX MSS losses in ../scripts)
-sys.path.insert(0, EXPERIMENTS_DIR)
-sys.path.append(os.path.join(EXPERIMENTS_DIR, "..", "scripts"))
+from src.paths import ROOT_DIR
+
+if TYPE_CHECKING:
+    import jax
 
 logging.basicConfig()
 log = logging.getLogger(__name__)
@@ -90,7 +81,7 @@ def setup_env(config: dict[str, Any]) -> None:
     if cache_dir and "JAX_COMPILATION_CACHE_DIR" not in os.environ:
         # Compiled steps are saved on disk and reused by later seeds and runs with the
         # same programs (only those that took at least 1 s to compile, JAX's default)
-        cache_dir = os.path.join(EXPERIMENTS_DIR, os.path.expanduser(cache_dir))
+        cache_dir = os.path.join(ROOT_DIR, os.path.expanduser(cache_dir))
         os.environ["JAX_COMPILATION_CACHE_DIR"] = os.path.abspath(cache_dir)
         log.info(f"Using the JAX compilation cache in {cache_dir}")
     devices = trainer_cfg.get("devices")
@@ -106,45 +97,32 @@ def setup_env(config: dict[str, Any]) -> None:
             )
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument(
-        "-c", "--config", required=True, help="Path, absolute or in configs/"
-    )
-    parser.add_argument("--seeds", type=int, nargs="+", default=None)
-    parser.add_argument(
-        "--stages", nargs="+", choices=["fit", "test"], default=["fit", "test"]
-    )
-    parser.add_argument(
-        "--set",
-        nargs="+",
-        default=[],
-        metavar="KEY=VALUE",
-        help="Overrides, e.g. trainer.max_epochs=2",
-    )
-    args = parser.parse_args()
+def import_class(class_path: str) -> Any:
+    """Imports e.g. `optax.adamw` or `src.experiments.models_jax.Spectral2DCNN`."""
+    module_name, name = class_path.rsplit(".", 1)
+    return getattr(importlib.import_module(module_name), name)
 
-    config_path = args.config
-    if not os.path.isfile(config_path):
-        config_path = os.path.join(CONFIGS_DIR, config_path)
-    config = load_config(config_path)
-    for override in args.set:
-        k, v = override.split("=", 1)
-        set_config_value(config, k, yaml.load(v, Loader=YamlLoader))
-    setup_env(config)
 
-    from src.trainer_jax import fit, test
+def instantiate(node: Any, key: "jax.Array", path: str = "") -> Any:
+    """Recursively instantiates `{class_path, init_args}` config nodes.
 
-    log.info(f"Running {' and '.join(args.stages)} with config: {config_path}")
-    seeds = args.seeds
-    if seeds is None:
-        seeds = [config.get("seed_everything", 0)]
-    else:
-        log.info(f"Running with seeds: {seeds}")
-    for seed in seeds:
-        if args.seeds is not None:
-            set_config_value(config, "data.init_args.shuffle_seed", seed)
-        if "fit" in args.stages:
-            fit(config, seed=seed)
-        if "test" in args.stages:
-            test(config, seed=seed)
+    Classes whose `__init__` has a `key` argument receive a PRNG key derived from
+    `key` and the node's config path, so each component's initialization only
+    depends on the seed and on where it is in the config.
+    """
+    import jax  # Not at the top level, see the module docstring
+
+    if isinstance(node, dict) and "class_path" in node:
+        cls = import_class(node["class_path"])
+        init_args = {
+            k: instantiate(v, key, f"{path}.{k}")
+            for k, v in (node.get("init_args") or {}).items()
+        }
+        if "key" in inspect.signature(cls).parameters and "key" not in init_args:
+            init_args["key"] = jax.random.fold_in(key, zlib.crc32(path.encode()))
+        return cls(**init_args)
+    if isinstance(node, dict):
+        return {k: instantiate(v, key, f"{path}.{k}") for k, v in node.items()}
+    if isinstance(node, list):
+        return [instantiate(v, key, f"{path}.{i}") for i, v in enumerate(node)]
+    return node

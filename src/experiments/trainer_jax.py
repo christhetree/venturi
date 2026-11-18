@@ -2,11 +2,12 @@
 Minimal Lightning-style trainer for the JAX / Equinox experiments.
 
 A run is described by the same kind of config as the PyTorch runs (`class_path` /
-`init_args` nodes), loaded by `scripts/train_jax.py`, with three main nodes:
+`init_args` nodes), loaded by `scripts/train.py`, with three main nodes:
 
-- `model`: the trainable Equinox model (e.g. `src.models_jax.Spectral2DCNN`).
+- `model`: the trainable Equinox model (e.g.
+  `src.experiments.models_jax.Spectral2DCNN`).
 - `loss`: the fixed parts of the objective, called as `loss(model, x, delta, *, key)`
-  and returning `(value, aux)` (e.g. `eval_808.loss_jax.DDSP808Loss`).
+  and returning `(value, aux)` (e.g. `src.experiments.losses_jax.DDSP808Loss`).
 - `data`: a data module with `batches(stage)`, `n_batches(stage)`, and `sr`.
 
 The training state is `(model, opt_state)`; the loss is passed to the jitted steps
@@ -20,7 +21,6 @@ Losses are logged to TensorBoard (event files in the run directory, viewable wit
 """
 
 import copy
-import importlib
 import inspect
 import json
 import logging
@@ -40,6 +40,7 @@ from scipy.io import wavfile
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from src.experiments.util import import_class, instantiate
 from src.paths import AUDIO_SAVE_DIR, OUT_DIR
 
 logging.basicConfig()
@@ -48,35 +49,6 @@ log.setLevel(level=os.environ.get("LOGLEVEL", "INFO"))
 
 JAX_LOGS_DIR = os.path.join(OUT_DIR, "jax_logs")
 N_TEST_AUDIO = 128  # Test items saved as audio, as in `DDSP808LightingModule`
-
-
-# Config =============================================================================
-def _import(class_path: str) -> Any:
-    module_name, name = class_path.rsplit(".", 1)
-    return getattr(importlib.import_module(module_name), name)
-
-
-def instantiate(node: Any, key: jax.Array, path: str = "") -> Any:
-    """Recursively instantiates `{class_path, init_args}` config nodes.
-
-    Classes whose `__init__` has a `key` argument receive a PRNG key derived from
-    `key` and the node's config path, so each component's initialization only
-    depends on the seed and on where it is in the config.
-    """
-    if isinstance(node, dict) and "class_path" in node:
-        cls = _import(node["class_path"])
-        init_args = {
-            k: instantiate(v, key, f"{path}.{k}")
-            for k, v in (node.get("init_args") or {}).items()
-        }
-        if "key" in inspect.signature(cls).parameters and "key" not in init_args:
-            init_args["key"] = jax.random.fold_in(key, zlib.crc32(path.encode()))
-        return cls(**init_args)
-    if isinstance(node, dict):
-        return {k: instantiate(v, key, f"{path}.{k}") for k, v in node.items()}
-    if isinstance(node, list):
-        return [instantiate(v, key, f"{path}.{i}") for i, v in enumerate(node)]
-    return node
 
 
 # Optimization =======================================================================
@@ -106,7 +78,7 @@ def make_optimizer(
         schedule = lambda step: per_epoch(step // steps_per_epoch)
     else:
         schedule = optax.constant_schedule(base_lr)
-    optim_cls = _import(opt_config["class_path"])
+    optim_cls = import_class(opt_config["class_path"])
     static_args = [
         p for p in inspect.signature(optim_cls).parameters if p != "learning_rate"
     ]
