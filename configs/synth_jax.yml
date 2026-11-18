@@ -11,3 +11,4 @@ init_args:
   hop_len: 256
   delta_min: -2048
   delta_max: 2048
+  scan_unroll: 16  # JAX only: faster on GPU when higher, see biquad_scan

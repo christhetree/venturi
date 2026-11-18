@@ -80,7 +80,10 @@ def highpass_coefficients(
 
 
 def biquad_scan(
-    x: Float[Array, "bs n"], b: Float[Array, "bs 3"], a: Float[Array, "bs 2"]
+    x: Float[Array, "bs n"],
+    b: Float[Array, "bs 3"],
+    a: Float[Array, "bs 2"],
+    unroll: int = 1,
 ) -> Float[Array, "bs n"]:
     """Direct form I biquad with zero initial state, run sample by sample with
     `lax.scan` (same recurrence as `torchaudio.functional.lfilter`, without clamping).
@@ -88,6 +91,13 @@ def biquad_scan(
     A parallel associative scan (e.g. `korvax.filter.lti.lfilter`) is not used
     because it diverges in float32 for low cutoffs with high Q (poles near |z| = 1),
     which this synth's parameter range includes.
+
+    `unroll` samples are computed per loop iteration. On GPU, every iteration has a
+    fixed overhead: for (8, 44100) samples, the forward and backward passes took
+    909 ms with `unroll=1`, 53 ms with `unroll=16`, and 12 ms with `unroll=128`. But
+    the float32 rounding error grows with `unroll` for low cutoffs with high Q: the
+    max error vs. float64 for 20 Hz, Q = 10 (peak ~1.2) is 3e-3 with `unroll=1` or 2,
+    1e-2 with 16, and 6e-2 with 128 (on CPU). At 1 kHz, Q = 0.7, it is ~1e-5 for all.
     """
     # FIR part, all samples at once
     xp = jnp.pad(x, ((0, 0), (2, 0)))
@@ -101,7 +111,7 @@ def biquad_scan(
         return (y_t, y1), y_t
 
     zeros = jnp.zeros_like(u[:, 0])
-    _, y = jax.lax.scan(step, (zeros, zeros), u.T)
+    _, y = jax.lax.scan(step, (zeros, zeros), u.T, unroll=unroll)
     return y.T
 
 
@@ -110,13 +120,16 @@ def time_shift(
 ) -> Float[Array, "bs n"]:
     """Delays item i by `delta[i] - delta_min` samples (zero padded on the left and
     truncated to the original length), like the loop in `DDSP808Synth.forward`.
+
+    Uses one dynamic slice per item rather than a gather (e.g. `take_along_axis`),
+    whose gradient is a scatter, which is slow on GPU with deterministic ops.
     """
-    n = y.shape[-1]
-    n_pad = (delta - delta_min)[:, None]
-    idx = jnp.arange(n)[None, :] - n_pad
-    valid = (idx >= 0) & (idx < n)
-    shifted = jnp.take_along_axis(y, jnp.clip(idx, 0, n - 1), axis=-1)
-    return jnp.where(valid, shifted, 0.0)
+    bs, n = y.shape
+    n_pad = delta - delta_min
+    y = jnp.pad(y, ((0, 0), (n, 0)))
+    return jnp.stack(
+        [jax.lax.dynamic_slice_in_dim(y[i], n - n_pad[i], n) for i in range(bs)]
+    )
 
 
 class DDSP808Synth(eqx.Module):
@@ -161,6 +174,7 @@ class DDSP808Synth(eqx.Module):
     hop_len: int = eqx.field(static=True)
     delta_min: int = eqx.field(static=True)
     delta_max: int = eqx.field(static=True)
+    scan_unroll: int = eqx.field(static=True)
     param_ranges: tuple[tuple[float, float], ...] = eqx.field(static=True)
     noise: Float[Array, "buffer_size"] | None
 
@@ -175,6 +189,7 @@ class DDSP808Synth(eqx.Module):
         hop_len: int = 256,
         delta_min: int = -2048,
         delta_max: int = 2048,
+        scan_unroll: int = 16,
         *,
         key: Key[Array, ""] | None = None,
     ) -> None:
@@ -188,6 +203,8 @@ class DDSP808Synth(eqx.Module):
             buffer_size: Length of the noise buffer, at least `num_samples`.
             J_cqt, Q_cqt, hop_len: CQT settings, stored for the training code.
             delta_min, delta_max: Allowed range of the time shift `delta` (samples).
+            scan_unroll: `unroll` of the noise filter's `biquad_scan`: higher is
+                much faster on GPU, but less accurate for low cutoffs with high Q.
             key: PRNG key for the noise buffer. Required if `buffer_noise` is True.
         """
         self.sr = sr
@@ -199,6 +216,7 @@ class DDSP808Synth(eqx.Module):
         self.hop_len = hop_len
         self.delta_min = delta_min
         self.delta_max = delta_max
+        self.scan_unroll = scan_unroll
 
         # (min, max) of each parameter, in the order of `param_names`
         osc_freq, osc_mod = (20.0, 2000.0), (-1.0, 2.0)
@@ -283,7 +301,7 @@ class DDSP808Synth(eqx.Module):
             )
         noise = noise * exp_decay_envelope(p["noise_decay"], sr, n)
         b, a = highpass_coefficients(p["noise_freq"], p["noise_q"], sr)
-        noise = biquad_scan(noise, b, a)
+        noise = biquad_scan(noise, b, a, unroll=self.scan_unroll)
         noise = jnp.clip(noise, -1.0, 1.0)  # torchaudio's lfilter clamps by default
         noise = db_gain(noise, p["noise_gain"])
 
