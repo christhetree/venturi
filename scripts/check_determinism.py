@@ -7,6 +7,9 @@ processes, launched like the training runs) and compare the fingerprints to chec
 determinism across runs.
 
     python scripts/check_determinism.py
+
+The XLA flags are set in `XLA_FLAGS` below (not by `setup_env` or the XLA_FLAGS
+environment variable), e.g. to test which ones make training deterministic.
 """
 
 import hashlib
@@ -23,17 +26,43 @@ N_STEPS = 10  # Training steps compared
 N_REPEATS = 20  # Runs of each part (nondeterminism can be intermittent)
 N_TRAIN_REPEATS = 3  # Runs of the training steps
 
+# The XLA flags of this check; None leaves XLA's default. The defaults below are the
+# flags that `setup_env` sets for training (`util.DETERMINISTIC_XLA_FLAGS`).
+XLA_FLAGS = {
+    # Deterministic implementations of the GPU ops that have one (e.g. scatter);
+    # documented as guaranteeing run-to-run determinism, but was not enough alone
+    "xla_gpu_deterministic_ops": True,
+    # Like the above (excludes nondeterministic ops), but keeps autotuning on
+    "xla_gpu_exclude_nondeterministic_ops": None,
+    # The layout of cuDNN convolutions (set at most one of them). NHWC made the
+    # convolutions of the model deterministic
+    "xla_gpu_force_conv_nhwc": None,
+    "xla_gpu_force_conv_nchw": None,
+    # Experimental: compiles convolutions with XLA instead of cuDNN (also made them
+    # deterministic)
+    "xla_gpu_experimental_enable_conv_fusion": None,
+    # GEMM and convolution autotuning: 0 = off, 1 = on, ... (see the XLA docs)
+    "xla_gpu_autotune_level": None,
+    # Command buffers (CUDA graphs): "" disables them (did not affect determinism)
+    "xla_gpu_enable_command_buffer": None,
+}
+
 config = load_config(os.path.join(CONFIGS_DIR, CONFIG))
 config["custom"]["run_name"] = "determinism_check"
+config["custom"]["is_deterministic"] = False  # So that setup_env adds no XLA flags
+os.environ["XLA_FLAGS"] = " ".join(
+    f"--{name}={str(value).lower() if isinstance(value, bool) else value}"
+    for name, value in XLA_FLAGS.items()
+    if value is not None
+)
 setup_env(config)
 
 import equinox as eqx  # noqa: E402
 import jax  # noqa: E402
 import jaxlib  # noqa: E402
 import numpy as np  # noqa: E402
-from jax.tree_util import Partial  # noqa: E402
 
-from src.experiments.models_jax import _layer_norm_2d, conv2d_same  # noqa: E402
+from src.experiments.models_jax import _layer_norm_2d  # noqa: E402
 from src.experiments.trainer_jax import (  # noqa: E402
     eval_step,
     make_train_step,
@@ -125,15 +154,11 @@ def layer_grad(layer, inp):
 m = run.model
 h = U[:, None]  # (bs, 1, n_bins, n_frames)
 for idx, (conv, pool, act) in enumerate(zip(m.convs, m.pools, m.acts)):
-    # The convolution as the model computes it, and with lax / cuDNN for comparison
     layers = [("layer norm", _layer_norm_2d)] if m.use_ln else []
-    layers += [("conv, lax (unused)", conv), ("conv", Partial(conv2d_same, conv))]
-    layers += [("max pool", pool), ("PReLU", act)]
+    layers += [("conv", conv), ("max pool", pool), ("PReLU", act)]
     for name, layer in layers:
-        out, grad_fn = layer_grad(layer, h)
+        h, grad_fn = layer_grad(layer, h)
         compare(f"  block {idx} {name} (fwd+bwd)", grad_fn)
-        if "unused" not in name:
-            h = out
 h, grad_fn = layer_grad(m.fc, h.mean(axis=(-2, -1)))
 compare("  linear after the blocks (fwd+bwd)", grad_fn)
 

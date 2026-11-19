@@ -35,6 +35,7 @@ import zlib
 from typing import Any
 
 import yaml
+from tqdm import tqdm
 
 # So that `src` (and the `class_path`s of the configs) can be imported
 sys.path.insert(0, os.path.abspath(os.path.join(__file__, "../../")))
@@ -158,11 +159,35 @@ def calc_theta_curvature(
     def dec_fn(theta: jax.Array, delta: jax.Array) -> jax.Array:
         return synth(theta, delta)
 
+    # The warmup computes all the curvature-vector products of a loss in one compiled
+    # call, so its own progress bar (over losses, here just one) only moves at the
+    # end. Instead, the products are counted by the loss, which is evaluated once per
+    # product and batch (and not by the warmup's checks of `enc_fn` and `dec_fn`).
+    # With `vmap_theta`, one evaluation computes the products of every theta at once
+    max_n_products = len(param_names) * n_iter * n_batches
+    n_products_per_call = len(param_names) if vmap_theta else 1
+    pbar = None
+
+    def on_product() -> None:
+        nonlocal pbar
+        if pbar is None:  # Created after compiling, when the first product is done
+            pbar = tqdm(
+                total=max_n_products,
+                desc="Curvature-vector products (fewer if converged early)",
+                unit="product",
+            )
+        pbar.update(n_products_per_call)
+
+    def loss_fn(x_hat: jax.Array, x: jax.Array) -> jax.Array:
+        # Without arguments, so that it is not unrolled over theta by `vmap_theta`
+        jax.debug.callback(on_product)
+        return loss.loss_func(x_hat, x)
+
     key = jax.random.fold_in(jax.random.key(seed), zlib.crc32(b"theta_curvature"))
     start = time.perf_counter()
     # A single loss (the training loss), so row 0 has the curvature of every theta
     result = warmup_lc_hvp(
-        [loss.loss_func],
+        [loss_fn],
         enc_fn,
         dec_fn,
         xs,
@@ -174,6 +199,8 @@ def calc_theta_curvature(
         tol=tol,
         vmap_theta=vmap_theta,
     )
+    if pbar is not None:
+        pbar.close()
     log.info(f"warmup_lc_hvp took {time.perf_counter() - start:.1f} s")
     curvatures = np.asarray(result.curvatures[0])
     residuals = np.asarray(result.relative_residuals[0])

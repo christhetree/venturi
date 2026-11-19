@@ -73,6 +73,18 @@ def set_config_value(config: dict[str, Any], dotted_key: str, value: Any) -> Non
     node[last] = value
 
 
+# XLA flags for deterministic runs on GPU (unless XLA_FLAGS already sets them).
+# `--xla_gpu_deterministic_ops` is not enough: with jaxlib 0.12.0.1, the cuDNN
+# convolutions XLA picked for some layers of `Spectral2DCNN` (the first one, on the
+# full CQT, and the last one, on 4x4 inputs) still had gradients that differed between
+# executions. Forcing the NHWC layout made them deterministic (on our GPU; check with
+# `scripts/check_determinism.py`).
+DETERMINISTIC_XLA_FLAGS = [
+    "--xla_gpu_deterministic_ops=true",
+    "--xla_gpu_force_conv_nhwc=true",
+]
+
+
 def setup_env(config: dict[str, Any]) -> None:
     """Sets the environment variables that JAX reads when it is imported or
     initializes the GPU, so this must run before JAX is imported."""
@@ -90,11 +102,12 @@ def setup_env(config: dict[str, Any]) -> None:
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in devices)
         log.info(f"Setting CUDA_VISIBLE_DEVICES = {os.environ['CUDA_VISIBLE_DEVICES']}")
     if (config.get("custom") or {}).get("is_deterministic", True):
-        flags = os.environ.get("XLA_FLAGS", "")
-        if "xla_gpu_deterministic_ops" not in flags:
-            os.environ["XLA_FLAGS"] = (
-                f"{flags} --xla_gpu_deterministic_ops=true".strip()
-            )
+        flags = os.environ.get("XLA_FLAGS", "").split()
+        for flag in DETERMINISTIC_XLA_FLAGS:
+            name = flag.split("=")[0]
+            if not any(f.split("=")[0] == name for f in flags):
+                flags.append(flag)
+        os.environ["XLA_FLAGS"] = " ".join(flags)
 
 
 def import_class(class_path: str) -> Any:
