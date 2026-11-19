@@ -1,4 +1,4 @@
-# JAX version of mss_meso_log.yml (same init_args)
+# JAX auraloss.freq.MultiResolutionSTFTLoss, with the init_args of mss_meso_log.yml in scrapl
 class_path: src.experiments.losses_jax.MultiResolutionSTFTLoss
 init_args:
   fft_sizes:

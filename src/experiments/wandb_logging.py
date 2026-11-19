@@ -8,12 +8,14 @@ the predictions every epoch) and as a plot of the target and prediction (wavefor
 and spectrograms), under `val_examples/<idx>/...`; the media panels of the wandb UI
 have a step slider to go through the epochs.
 
-The mode is `custom.wandb_mode` in the config: `online` (the default, which needs
-`wandb login` once), `offline` (upload later with
-`wandb sync out/wandb_logs/wandb/offline-run-*`), or `disabled`. The `WANDB_MODE`
-environment variable takes precedence. The local files of an online run are deleted
-once it has finished and uploaded everything, so they do not pile up; those of an
-offline run, or of a run that failed, are kept.
+The mode is `custom.use_wandb_gpu` in the config when JAX runs on GPU (default
+`online`, which needs `wandb login` once) and `custom.use_wandb_cpu` on CPU (default
+`offline`, e.g. locally; upload later with
+`wandb sync out/wandb_logs/wandb/offline-run-*`). Each is a wandb mode (`online`,
+`offline`, or `disabled`) or a bool (true for `online`, false for `disabled`). The
+`WANDB_MODE` environment variable takes precedence. The local files of an online run
+are deleted once it has finished and uploaded everything, so they do not pile up;
+those of an offline run, or of a run that failed, are kept.
 """
 
 import logging
@@ -23,6 +25,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+import jax
 import numpy as np
 import scipy.signal
 import wandb
@@ -34,6 +37,20 @@ from src.paths import WANDB_LOGS_DIR
 logging.basicConfig()
 log = logging.getLogger(__name__)
 log.setLevel(level=os.environ.get("LOGLEVEL", "INFO"))
+
+
+def wandb_mode(custom: dict[str, Any]) -> str:
+    """The wandb mode for the backend JAX runs on, from `custom.use_wandb_gpu` /
+    `custom.use_wandb_cpu` (see the module docstring)."""
+    if "WANDB_MODE" in os.environ:
+        return os.environ["WANDB_MODE"]
+    if jax.default_backend() == "cpu":
+        mode = custom.get("use_wandb_cpu", "offline")
+    else:
+        mode = custom.get("use_wandb_gpu", "online")
+    if isinstance(mode, bool):
+        return "online" if mode else "disabled"
+    return mode
 
 
 @contextmanager
@@ -52,7 +69,7 @@ def wandb_run(
         group=name,
         config=config,
         dir=WANDB_LOGS_DIR,
-        mode=os.environ.get("WANDB_MODE") or custom.get("wandb_mode", "online"),
+        mode=wandb_mode(custom),
         id=resume_id,
         resume="allow" if resume_id else None,
     )

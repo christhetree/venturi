@@ -1,4 +1,4 @@
-# JAX version of mss_revisited.yml (same init_args)
+# JAX LogMSSLoss (MSS revisited), with the init_args of mss_revisited.yml in scrapl
 class_path: src.experiments.losses_jax.LogMSSLoss
 init_args:
   fft_sizes:

@@ -14,6 +14,9 @@ data `shuffle_seed`, so every seed uses a different train / val / test split.
 
 `--stages` runs `fit` (training) and / or `test` (of the best checkpoint of a
 previous `fit` with the same config and seed); both by default.
+
+Without arguments (e.g. when run from an IDE), the defaults are the constants below
+(`CONFIG`, `SEEDS`, `STAGES`, and `OVERRIDES`), which can be edited.
 """
 
 import argparse
@@ -38,20 +41,24 @@ logging.basicConfig()
 log = logging.getLogger(__name__)
 log.setLevel(level=os.environ.get("LOGLEVEL", "INFO"))
 
+# Defaults of the command line arguments, e.g. for running from an IDE without any
+CONFIG = "train.yml"  # Path, absolute or in configs/
+SEEDS = None  # e.g. [0, 1, 2]; None for the config's `seed_everything`
+STAGES = ["fit", "test"]
+OVERRIDES = []  # e.g. ["trainer.max_epochs=2", "data.init_args.n_train=32"]
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
-        "-c", "--config", required=True, help="Path, absolute or in configs/"
+        "-c", "--config", default=CONFIG, help="Path, absolute or in configs/"
     )
-    parser.add_argument("--seeds", type=int, nargs="+", default=None)
-    parser.add_argument(
-        "--stages", nargs="+", choices=["fit", "test"], default=["fit", "test"]
-    )
+    parser.add_argument("--seeds", type=int, nargs="+", default=SEEDS)
+    parser.add_argument("--stages", nargs="+", choices=["fit", "test"], default=STAGES)
     parser.add_argument(
         "--set",
         nargs="+",
-        default=[],
+        default=OVERRIDES,
         metavar="KEY=VALUE",
         help="Overrides, e.g. trainer.max_epochs=2",
     )

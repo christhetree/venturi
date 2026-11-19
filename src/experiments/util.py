@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from src.paths import ROOT_DIR
+from src.paths import JAX_CACHE_DIR
 
 if TYPE_CHECKING:
     import jax
@@ -77,13 +77,13 @@ def setup_env(config: dict[str, Any]) -> None:
     """Sets the environment variables that JAX reads when it is imported or
     initializes the GPU, so this must run before JAX is imported."""
     trainer_cfg = config.get("trainer") or {}
-    cache_dir = trainer_cfg.get("compilation_cache_dir")
-    if cache_dir and "JAX_COMPILATION_CACHE_DIR" not in os.environ:
+    if "JAX_COMPILATION_CACHE_DIR" not in os.environ:
         # Compiled steps are saved on disk and reused by later seeds and runs with the
         # same programs (only those that took at least 1 s to compile, JAX's default)
-        cache_dir = os.path.join(ROOT_DIR, os.path.expanduser(cache_dir))
-        os.environ["JAX_COMPILATION_CACHE_DIR"] = os.path.abspath(cache_dir)
-        log.info(f"Using the JAX compilation cache in {cache_dir}")
+        os.environ["JAX_COMPILATION_CACHE_DIR"] = JAX_CACHE_DIR
+    log.info(
+        f"Using the JAX compilation cache in {os.environ['JAX_COMPILATION_CACHE_DIR']}"
+    )
     devices = trainer_cfg.get("devices")
     if isinstance(devices, list) and "CUDA_VISIBLE_DEVICES" not in os.environ:
         # Otherwise JAX preallocates memory on every visible GPU

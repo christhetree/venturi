@@ -239,7 +239,7 @@ class Run:
     name: str
     dir: str  # The resolved config and checkpoints
     seed: int
-    config: dict[str, Any]  # With the CPU batch size and the data seed applied
+    config: dict[str, Any]  # With the CPU settings and the data seed applied
     data: Any
     model: eqx.Module  # Freshly initialized
     loss: Callable[..., Any]

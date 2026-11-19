@@ -3,8 +3,9 @@ seed_everything: 420
 
 custom:
   project_name: venturi  # The wandb project
-  wandb_mode: online    # online, offline, or disabled (or the WANDB_MODE env var)
-  model_name: mss_meso_log_724k_adamw_1e-4t5_jax
+  use_wandb_gpu: online   # wandb mode on GPU: online, offline, or disabled (or true / false)
+  use_wandb_cpu: offline  # wandb mode on CPU, e.g. locally (the WANDB_MODE env var overrides both)
+  model_name: mss_rev_724k_adamw_1e-4t5
   dataset_name: mars_808_n681_b8_micro
   cpu_batch_size: 8
   is_deterministic: true
@@ -15,7 +16,6 @@ trainer:
   accumulate_grad_batches: 1
   log_every_n_steps: 50           # how often training losses are copied to the host
   n_val_audio: 5                  # val items logged to wandb (audio and plots) every epoch
-  compilation_cache_dir: out/jax_cache  # relative to the repository root
 
 data:
   class_path: src.experiments.data_jax.WavDataModule
