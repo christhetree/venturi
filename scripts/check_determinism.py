@@ -60,19 +60,34 @@ def max_diff(a, b):
     return float(np.max(np.abs(a.astype(np.float64) - b))) if a.size else 0.0
 
 
+def fingerprint(arrays):
+    return hashlib.sha256(b"".join(a.tobytes() for a in arrays)).hexdigest()[:16]
+
+
+def format_runs(runs):
+    """e.g. [1] -> "run 1", [2, 3, 4] -> "runs 2-4", [2, 5] -> "runs 2, 5"."""
+    if len(runs) == 1:
+        return f"run {runs[0]}"
+    if runs == list(range(runs[0], runs[-1] + 1)):
+        return f"runs {runs[0]}-{runs[-1]}"
+    return "runs " + ", ".join(map(str, runs))
+
+
 def compare(name, fn, n_repeats=N_REPEATS):
-    """Runs `fn` `n_repeats` times and reports whether the outputs are identical."""
+    """Runs `fn` `n_repeats` times and reports whether the outputs are identical, and
+    if not, which runs gave the same outputs."""
     outs = [as_arrays(fn()) for _ in range(n_repeats)]
-    n_diff = sum(
-        not all(np.array_equal(a, b) for a, b in zip(outs[0], out)) for out in outs[1:]
-    )
-    if n_diff == 0:
+    groups = {}  # Fingerprint -> runs (from 1) with these outputs
+    for idx, out in enumerate(outs, start=1):
+        groups.setdefault(fingerprint(out), []).append(idx)
+    if len(groups) == 1:
         result = f"deterministic ({n_repeats} runs)"
     else:
         diff = max(max_diff(a, b) for out in outs[1:] for a, b in zip(outs[0], out))
+        same = " | ".join(format_runs(runs) for runs in groups.values())
         result = (
-            f"NOT deterministic: {n_diff} of {n_repeats - 1} runs differ from the "
-            f"first (max diff {diff:.2e})"
+            f"NOT deterministic: {len(groups)} different results in {n_repeats} runs "
+            f"(same results: {same}; max diff {diff:.2e})"
         )
     print(f"{name:38s} {result}")
     return outs
@@ -148,5 +163,7 @@ if differs.any():
         f"  The losses first differ at step {step}: "
         + ", ".join(f"{v:.6f}" for v in losses[:, step])
     )
-fingerprint = hashlib.sha256(b"".join(a.tobytes() for a in outs[0])).hexdigest()[:16]
-print(f"Fingerprint of {N_STEPS} training steps: {fingerprint}")
+print(
+    f"Fingerprints of {N_STEPS} training steps: {fingerprint(outs[0])} (run 1), "
+    f"{fingerprint(outs[-1])} (run {len(outs)})"
+)
