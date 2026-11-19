@@ -2,12 +2,15 @@
 Minimal Lightning-style trainer for the JAX / Equinox experiments.
 
 A run is described by the same kind of config as the PyTorch runs (`class_path` /
-`init_args` nodes), loaded by `scripts/train.py`, with three main nodes:
+`init_args` nodes), loaded by `scripts/train.py`, with these main nodes:
 
 - `model`: the trainable Equinox model (e.g.
   `src.experiments.models_jax.Spectral2DCNN`).
 - `loss`: the fixed parts of the objective, called as `loss(model, x, delta, *, key)`
-  and returning `(value, aux)` (e.g. `src.experiments.losses_jax.DDSP808Loss`).
+  and returning `(value, aux)`, where `aux` has the target `x` and the prediction
+  `x_hat` (e.g. `src.experiments.losses_jax.DDSP808Loss`).
+- `metrics` (optional): `{name: node}` of functions of `(x_hat, x)`, e.g. MSS losses,
+  computed on the validation and test sets whatever the training loss.
 - `data`: a data module with `batches(stage)`, `n_batches(stage)`, and `sr`.
 
 The training state is `(model, opt_state)`; the loss is passed to the jitted steps
@@ -15,12 +18,11 @@ as an argument.
 
 For a config and a seed, `fit` trains with AdamW (or any optax optimizer), validates
 after every epoch, and keeps the checkpoint with the lowest validation loss; `test`
-evaluates a checkpoint on the test set, also in a separate process.
-Losses, and the audio of the first `trainer.n_val_audio` validation items after every
-epoch, are logged to TensorBoard (event files in the run directory), viewable with
-`tensorboard --logdir out/jax_logs --samples_per_plugin audio=1000` (by default,
-TensorBoard only keeps 10 random steps of each audio tag). The test audio is saved to
-`AUDIO_SAVE_DIR`.
+evaluates a checkpoint on the test set, also in a separate process. Both log to
+Weights & Biases (see `wandb_logging.py`): the training loss and learning rate, the
+validation loss and metrics, and the audio and plots of the first
+`trainer.n_val_audio` validation items after every epoch; `test` adds the test loss
+and metrics to the summary of the run. The test audio is saved to `AUDIO_SAVE_DIR`.
 """
 
 import copy
@@ -38,12 +40,13 @@ import equinox as eqx
 import jax
 import numpy as np
 import optax
+import wandb
 import yaml
 from scipy.io import wavfile
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from src.experiments.util import import_class, instantiate
+from src.experiments.wandb_logging import start_run, val_example_media
 from src.paths import AUDIO_SAVE_DIR, OUT_DIR
 
 logging.basicConfig()
@@ -123,11 +126,18 @@ def make_train_step(optim: optax.GradientTransformation) -> Callable[..., Any]:
 
 @eqx.filter_jit
 def eval_step(
-    model: eqx.Module, loss: Callable[..., Any], x: jax.Array
-) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """Validation / test step: the loss and outputs of the model in inference mode
-    (no dropout). Defined once, so `fit` and `test` share its compilation."""
-    return loss(eqx.nn.inference_mode(model), x)
+    model: eqx.Module,
+    loss: Callable[..., Any],
+    metrics: dict[str, Callable[..., Any]],
+    x: jax.Array,
+) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+    """Validation / test step, with the model in inference mode (no dropout): the
+    loss and `metrics` (of the prediction and target), and the outputs of the loss.
+    Defined once, so `fit` and `test` share its compilation."""
+    value, out = loss(eqx.nn.inference_mode(model), x)
+    values = {"loss": value}
+    values.update({name: m(out["x_hat"], out["x"]) for name, m in metrics.items()})
+    return values, out
 
 
 # Checkpoints ========================================================================
@@ -152,7 +162,7 @@ def load_ckpt(
 
 # Training ===========================================================================
 def log_train_steps(
-    writer: SummaryWriter,
+    wb: wandb.Run,
     pending: list[tuple[int, jax.Array, jax.Array]],
     accumulate: int,
     pbar: tqdm,
@@ -165,8 +175,7 @@ def log_train_steps(
     values = jax.device_get([(loss, lr) for _, loss, lr in pending])
     for (n_batches_seen, _, _), (loss, lr) in zip(pending, values):
         step = n_batches_seen // accumulate
-        writer.add_scalar("train/loss", float(loss), step)
-        writer.add_scalar("train/lr", float(lr), step)
+        wb.log({"train/loss": float(loss), "train/lr": float(lr)}, step=step)
     loss, lr = values[-1]
     pbar.set_postfix(loss=f"{float(loss):.4f}", lr=f"{float(lr):.2e}")
 
@@ -174,22 +183,32 @@ def log_train_steps(
 def evaluate(
     model: eqx.Module,
     loss: Callable[..., Any],
+    metrics: dict[str, Callable[..., Any]],
     data: Any,
     stage: str,
     n_outputs: int = 0,
-) -> tuple[float, list[dict[str, np.ndarray]]]:
-    """Mean loss over the batches of `stage`, and the outputs of (at least) the first
+) -> tuple[dict[str, float], list[dict[str, np.ndarray]]]:
+    """Means of the loss and `metrics` over the batches of `stage` (as a dict with
+    `"loss"` and the names of the metrics), and the outputs of (at least) the first
     `n_outputs` items. Everything is copied to the host once, at the end, so the
     batches run without waiting for each other."""
     values, outputs, n_kept = [], [], 0
     for x, _, _ in data.batches(stage):
-        value, out = eval_step(model, loss, x)
-        values.append(value)
+        batch_values, out = eval_step(model, loss, metrics, x)
+        values.append(batch_values)
         if n_kept < n_outputs:
             outputs.append(out)
             n_kept += x.shape[0]
     values, outputs = jax.device_get((values, outputs))
-    return float(np.mean(np.asarray(values, dtype=np.float64))), outputs
+    means = {
+        k: float(np.mean(np.asarray([v[k] for v in values], dtype=np.float64)))
+        for k in values[0]
+    }
+    return means, outputs
+
+
+def format_metrics(stage: str, values: dict[str, float]) -> str:
+    return ", ".join(f"{stage}/{k} = {v:.6f}" for k, v in values.items())
 
 
 def save_test_audio(
@@ -212,41 +231,18 @@ def save_test_audio(
         )
 
 
-def log_val_audio(
-    writer: SummaryWriter,
-    outputs: list[dict[str, np.ndarray]],
-    n: int,
-    step: int,
-    sr: int,
-    log_targets: bool,
-) -> None:
-    """Logs the first `n` validation items to TensorBoard's Audio tab: the
-    predictions (`val_audio/<idx>/prediction`) and, if `log_targets`, the targets
-    (`val_audio/<idx>/target`). The validation set is not shuffled, so `<idx>` is the
-    same item at every epoch."""
-    if n <= 0 or not outputs:
-        return
-    x = np.concatenate([o["x"] for o in outputs])[:n]
-    x_hat = np.concatenate([o["x_hat"] for o in outputs])[:n]
-    for idx in range(x.shape[0]):
-        if log_targets:
-            writer.add_audio(f"val_audio/{idx}/target", x[idx], step, sample_rate=sr)
-        writer.add_audio(
-            f"val_audio/{idx}/prediction", x_hat[idx], step, sample_rate=sr
-        )
-
-
 @dataclass
 class Run:
     """What `fit` and `test` build from a config and a seed."""
 
     name: str
-    dir: str  # TensorBoard logs, the resolved config, and checkpoints
+    dir: str  # The resolved config and checkpoints
     seed: int
     config: dict[str, Any]  # With the CPU batch size and the data seed applied
     data: Any
     model: eqx.Module  # Freshly initialized
     loss: Callable[..., Any]
+    metrics: dict[str, Callable[..., Any]]
     optim: optax.GradientTransformation
     accumulate: int
 
@@ -281,11 +277,14 @@ def setup(config: dict[str, Any], seed: int) -> Run:
     data = instantiate(config["data"], key, "data")
     model = instantiate(config["model"], key, "model")
     loss = instantiate(config["loss"], key, "loss")
+    metrics = instantiate(config.get("metrics") or {}, key, "metrics")
     steps_per_epoch = data.n_batches("train") // accumulate
     optim = make_optimizer(
         config["optimizer"], config.get("lr_scheduler"), steps_per_epoch, accumulate
     )
-    return Run(name, run_dir, seed, config, data, model, loss, optim, accumulate)
+    return Run(
+        name, run_dir, seed, config, data, model, loss, metrics, optim, accumulate
+    )
 
 
 def fit(config: dict[str, Any], seed: int) -> float:
@@ -297,11 +296,10 @@ def fit(config: dict[str, Any], seed: int) -> float:
     # Training losses are copied to the host (which waits for the GPU) only every
     # `log_every_n_steps` steps and at the end of each epoch
     log_every_n_steps = trainer_cfg.get("log_every_n_steps", 50)
-    # Validation items logged as audio after every epoch (the targets only once)
-    n_val_audio = trainer_cfg.get("n_val_audio", 4)
+    # Validation items logged as audio and plots after every epoch
+    n_val_audio = trainer_cfg.get("n_val_audio", 5)
     with open(os.path.join(run.dir, "config.yml"), "w") as f:
         yaml.safe_dump(run.config, f, sort_keys=False)
-    writer = SummaryWriter(log_dir=run.dir)
 
     model, loss, data, accumulate = run.model, run.loss, run.data, run.accumulate
     n_params = sum(p.size for p in jax.tree.leaves(trainable(model)))
@@ -312,64 +310,81 @@ def fit(config: dict[str, Any], seed: int) -> float:
     train_key = jax.random.fold_in(jax.random.key(seed), zlib.crc32(b"train"))
     n_batches_seen = 0
     best_val_loss = math.inf
-    for epoch in range(max_epochs):
-        pbar = tqdm(
-            data.batches("train"),
-            total=data.n_batches("train"),
-            desc=f"seed {seed} epoch {epoch}",
-        )
-        pending = []  # Device arrays of the training steps not logged yet
-        for x, _, delta in pbar:
-            step_key = jax.random.fold_in(train_key, n_batches_seen)
-            model, opt_state, train_loss = train_step(
-                model, opt_state, loss, x, delta, step_key
+    with start_run(run.config, run.name, seed) as wb:
+        # The summary of the run shows the best (lowest) validation values
+        for name in ["loss", *run.metrics]:
+            wb.define_metric(f"val/{name}", summary="min")
+        for epoch in range(max_epochs):
+            pbar = tqdm(
+                data.batches("train"),
+                total=data.n_batches("train"),
+                desc=f"seed {seed} epoch {epoch}",
             )
-            n_batches_seen += 1
-            pending.append((n_batches_seen, train_loss, current_lr(opt_state)))
-            if len(pending) == log_every_n_steps:
-                log_train_steps(writer, pending, accumulate, pbar)
-                pending = []
-        log_train_steps(writer, pending, accumulate, pbar)
+            pending = []  # Device arrays of the training steps not logged yet
+            for x, _, delta in pbar:
+                step_key = jax.random.fold_in(train_key, n_batches_seen)
+                model, opt_state, train_loss = train_step(
+                    model, opt_state, loss, x, delta, step_key
+                )
+                n_batches_seen += 1
+                pending.append((n_batches_seen, train_loss, current_lr(opt_state)))
+                if len(pending) == log_every_n_steps:
+                    log_train_steps(wb, pending, accumulate, pbar)
+                    pending = []
+            log_train_steps(wb, pending, accumulate, pbar)
 
-        val_loss, val_outputs = evaluate(
-            model, loss, data, "val", n_outputs=n_val_audio
-        )
-        step = n_batches_seen // accumulate
-        writer.add_scalar("val/loss", val_loss, step)
-        writer.add_scalar("epoch", epoch, step)
-        log_val_audio(
-            writer, val_outputs, n_val_audio, step, data.sr, log_targets=epoch == 0
-        )
-        writer.flush()
-        is_best = val_loss < best_val_loss
-        log.info(
-            f"seed {seed} epoch {epoch}: val/loss = {val_loss:.6f}{' (best)' * is_best}"
-        )
-        if is_best:
-            best_val_loss = val_loss
-            meta = {"seed": seed, "epoch": epoch, "step": step, "val_loss": val_loss}
-            save_ckpt(run.best_ckpt_path, model, opt_state, meta)
+            val_values, val_outputs = evaluate(
+                model, loss, run.metrics, data, "val", n_outputs=n_val_audio
+            )
+            step = n_batches_seen // accumulate
+            to_log = {f"val/{k}": v for k, v in val_values.items()}
+            to_log["epoch"] = epoch
+            if not wb.disabled:
+                to_log.update(
+                    val_example_media(
+                        val_outputs, n_val_audio, data.sr, step, epoch == 0
+                    )
+                )
+            wb.log(to_log, step=step)
 
-    writer.close()
+            val_loss = val_values["loss"]
+            is_best = val_loss < best_val_loss
+            log.info(
+                f"seed {seed} epoch {epoch}: {format_metrics('val', val_values)}"
+                f"{' (best)' * is_best}"
+            )
+            if is_best:
+                best_val_loss = val_loss
+                meta = {
+                    "seed": seed,
+                    "epoch": epoch,
+                    "step": step,
+                    "val": val_values,
+                    "wandb_id": None if wb.disabled else wb.id,
+                }
+                save_ckpt(run.best_ckpt_path, model, opt_state, meta)
+
     return best_val_loss
 
 
 def test(config: dict[str, Any], seed: int, ckpt_path: str | None = None) -> float:
     """Tests a checkpoint, by default the best one that `fit` saved for this config
-    and seed: logs `test/loss` to TensorBoard and saves the test audio. Can run in a
-    different process from `fit`. Returns the test loss."""
+    and seed: adds the test loss and metrics to the summary of its wandb run (resumed
+    from the checkpoint's metadata) and saves the test audio. Can run in a different
+    process from `fit`. Returns the test loss."""
     run = setup(config, seed)
     ckpt_path = (ckpt_path or run.best_ckpt_path).removesuffix(".eqx")
     opt_state_like = run.optim.init(trainable(run.model))
     model, _, meta = load_ckpt(ckpt_path, run.model, opt_state_like)
-    test_loss, outputs = evaluate(
-        model, run.loss, run.data, "test", n_outputs=N_TEST_AUDIO
+    test_values, outputs = evaluate(
+        model, run.loss, run.metrics, run.data, "test", n_outputs=N_TEST_AUDIO
     )
-    with SummaryWriter(log_dir=run.dir) as writer:
-        writer.add_scalar("test/loss", test_loss, meta["step"])
     log.info(
-        f"seed {seed}: test/loss = {test_loss:.6f} "
+        f"seed {seed}: {format_metrics('test', test_values)} "
         f"(checkpoint {ckpt_path}.eqx from epoch {meta['epoch']})"
     )
+    with start_run(run.config, run.name, seed, resume_id=meta.get("wandb_id")) as wb:
+        wb.summary.update({f"test/{k}": v for k, v in test_values.items()})
+        wb.summary.update({"test/ckpt_epoch": meta["epoch"]})
     save_test_audio(outputs, run.name, seed, sr=run.data.sr, max_n=N_TEST_AUDIO)
-    return test_loss
+    return test_values["loss"]
