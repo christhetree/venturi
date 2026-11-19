@@ -32,6 +32,7 @@ import jax  # noqa: E402
 import jaxlib  # noqa: E402
 import numpy as np  # noqa: E402
 
+from src.experiments.models_jax import _layer_norm_2d  # noqa: E402
 from src.experiments.trainer_jax import (  # noqa: E402
     eval_step,
     make_train_step,
@@ -106,6 +107,30 @@ def model_grad(m, U_, k):
 
 
 compare("model (fwd+bwd)", lambda: model_grad(run.model, U, key))
+
+
+def layer_grad(layer, inp):
+    """The output of a layer (vmapped over the batch), and a function computing the
+    gradients w.r.t. the layer and its input, for a random cotangent."""
+    out = jax.vmap(layer)(inp)
+    cotangent = jax.random.normal(key, out.shape)
+    grad = eqx.filter_jit(
+        eqx.filter_grad(lambda li, c: (jax.vmap(li[0])(li[1]) * c).sum())
+    )
+    return out, lambda: grad((layer, inp), cotangent)
+
+
+# Each layer of the model, on the activations of the first batch
+m = run.model
+h = U[:, None]  # (bs, 1, n_bins, n_frames)
+for idx, (conv, pool, act) in enumerate(zip(m.convs, m.pools, m.acts)):
+    layers = [("layer norm", _layer_norm_2d)] if m.use_ln else []
+    layers += [("conv", conv), ("max pool", pool), ("PReLU", act)]
+    for name, layer in layers:
+        h, grad_fn = layer_grad(layer, h)
+        compare(f"  block {idx} {name} (fwd+bwd)", grad_fn)
+h, grad_fn = layer_grad(m.fc, h.mean(axis=(-2, -1)))
+compare("  linear after the blocks (fwd+bwd)", grad_fn)
 
 theta = jax.random.uniform(key, (x.shape[0], run.loss.synth.n_params))
 synth_grad = eqx.filter_jit(lambda th, s, d: jax.grad(lambda th_: s(th_, d).sum())(th))
