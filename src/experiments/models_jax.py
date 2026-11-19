@@ -36,6 +36,40 @@ def _layer_norm_2d(
     return (x - mean) * jax.lax.rsqrt(var + eps)
 
 
+def conv2d_same(conv: eqx.nn.Conv2d, x: Float[Array, "c h w"]) -> Float[Array, "o h w"]:
+    """`conv(x)` for a stride 1, ungrouped, zero-padded "SAME" `eqx.nn.Conv2d` (like
+    those of `Spectral2DCNN`), computed as a sum over the kernel taps of matrix
+    products with shifted slices of the padded input, instead of with
+    `lax.conv_general_dilated`. Same result up to float rounding, but deterministic
+    gradients on GPU: for some of the model's layers, XLA uses cuDNN convolutions whose
+    gradients differ between executions even with `--xla_gpu_deterministic_ops` (see
+    `scripts/check_determinism.py`)."""
+    if (
+        conv.stride != (1, 1)
+        or conv.groups != 1
+        or conv.padding != "SAME"
+        or conv.padding_mode != "ZEROS"
+    ):
+        raise ValueError("Only stride 1, ungrouped, zero-padded 'SAME' convolutions")
+    _, _, kh, kw = conv.weight.shape
+    dh, dw = conv.dilation
+    h, w = x.shape[1:]
+    ph, pw = dh * (kh - 1), dw * (kw - 1)  # Total padding, as in lax's "SAME"
+    x = jnp.pad(x, ((0, 0), (ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2)))
+    out = sum(
+        jnp.einsum(
+            "oc,chw->ohw",
+            conv.weight[:, :, i, j],
+            x[:, i * dh : i * dh + h, j * dw : j * dw + w],
+        )
+        for i in range(kh)
+        for j in range(kw)
+    )
+    if conv.use_bias:
+        out = out + conv.bias
+    return out
+
+
 def _prelu() -> eqx.nn.PReLU:
     """PyTorch's default `nn.PReLU()`. The slope is created with an explicit dtype:
     `eqx.nn.PReLU(0.25)` makes it weakly typed, so it changes type after the first
@@ -70,8 +104,9 @@ class Spectral2DCNN(eqx.Module):
     """2D CNN over a (log-)CQT that predicts `n_params` values in [0, 1], with a
     separate MLP head per parameter.
 
-    Each block is LayerNorm (optional, no affine) -> Conv2d ("same" padding) ->
-    MaxPool2d -> PReLU. The output is averaged over time and frequency, then passes
+    Each block is LayerNorm (optional, no affine) -> Conv2d ("same" padding, computed
+    by `conv2d_same` for deterministic gradients on GPU) -> MaxPool2d -> PReLU. The
+    output is averaged over time and frequency, then passes
     through Linear -> PReLU -> Dropout and the parameter heads. Unlike the PyTorch
     version, which returns a list of `n_params` tensors, this returns one array of
     shape `(n_params,)`. Initialization uses the same distributions as PyTorch;
@@ -189,7 +224,7 @@ class Spectral2DCNN(eqx.Module):
         for conv, pool, act in zip(self.convs, self.pools, self.acts):
             if self.use_ln:
                 x = _layer_norm_2d(x)
-            x = act(pool(conv(x)))
+            x = act(pool(conv2d_same(conv, x)))  # Not conv(x), see conv2d_same
         x = jnp.mean(x, axis=(-2, -1))
         x = self.fc_act(self.fc(x))
 

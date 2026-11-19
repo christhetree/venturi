@@ -31,8 +31,9 @@ import equinox as eqx  # noqa: E402
 import jax  # noqa: E402
 import jaxlib  # noqa: E402
 import numpy as np  # noqa: E402
+from jax.tree_util import Partial  # noqa: E402
 
-from src.experiments.models_jax import _layer_norm_2d  # noqa: E402
+from src.experiments.models_jax import _layer_norm_2d, conv2d_same  # noqa: E402
 from src.experiments.trainer_jax import (  # noqa: E402
     eval_step,
     make_train_step,
@@ -124,11 +125,15 @@ def layer_grad(layer, inp):
 m = run.model
 h = U[:, None]  # (bs, 1, n_bins, n_frames)
 for idx, (conv, pool, act) in enumerate(zip(m.convs, m.pools, m.acts)):
+    # The convolution as the model computes it, and with lax / cuDNN for comparison
     layers = [("layer norm", _layer_norm_2d)] if m.use_ln else []
-    layers += [("conv", conv), ("max pool", pool), ("PReLU", act)]
+    layers += [("conv, lax (unused)", conv), ("conv", Partial(conv2d_same, conv))]
+    layers += [("max pool", pool), ("PReLU", act)]
     for name, layer in layers:
-        h, grad_fn = layer_grad(layer, h)
+        out, grad_fn = layer_grad(layer, h)
         compare(f"  block {idx} {name} (fwd+bwd)", grad_fn)
+        if "unused" not in name:
+            h = out
 h, grad_fn = layer_grad(m.fc, h.mean(axis=(-2, -1)))
 compare("  linear after the blocks (fwd+bwd)", grad_fn)
 
