@@ -20,7 +20,8 @@ from src.paths import CONFIGS_DIR  # noqa: E402
 
 CONFIG = "train.yml"
 N_STEPS = 10  # Training steps compared
-N_REPEATS = 3  # Runs of each computation
+N_REPEATS = 20  # Runs of each part (nondeterminism can be intermittent)
+N_TRAIN_REPEATS = 3  # Runs of the training steps
 
 config = load_config(os.path.join(CONFIGS_DIR, CONFIG))
 config["custom"]["run_name"] = "determinism_check"
@@ -55,18 +56,26 @@ def as_arrays(tree):
     return [np.asarray(leaf) for leaf in jax.tree.leaves(jax.device_get(tree))]
 
 
-def compare(name, fn):
-    """Runs `fn` `N_REPEATS` times and reports whether the outputs are identical."""
-    outs = [as_arrays(fn()) for _ in range(N_REPEATS)]
-    max_diff = max(
-        float(np.max(np.abs(a.astype(np.float64) - b))) if a.size else 0.0
-        for out in outs[1:]
-        for a, b in zip(outs[0], out)
+def max_diff(a, b):
+    return float(np.max(np.abs(a.astype(np.float64) - b))) if a.size else 0.0
+
+
+def compare(name, fn, n_repeats=N_REPEATS):
+    """Runs `fn` `n_repeats` times and reports whether the outputs are identical."""
+    outs = [as_arrays(fn()) for _ in range(n_repeats)]
+    n_diff = sum(
+        not all(np.array_equal(a, b) for a, b in zip(outs[0], out)) for out in outs[1:]
     )
-    same = all(np.array_equal(a, b) for out in outs[1:] for a, b in zip(outs[0], out))
-    result = "deterministic" if same else f"NOT deterministic (max diff {max_diff:.2e})"
-    print(f"{name:35s} {result}")
-    return outs[0]
+    if n_diff == 0:
+        result = f"deterministic ({n_repeats} runs)"
+    else:
+        diff = max(max_diff(a, b) for out in outs[1:] for a, b in zip(outs[0], out))
+        result = (
+            f"NOT deterministic: {n_diff} of {n_repeats - 1} runs differ from the "
+            f"first (max diff {diff:.2e})"
+        )
+    print(f"{name:38s} {result}")
+    return outs
 
 
 # The parts of the training step, on the first batch
@@ -97,6 +106,23 @@ compare(
     lambda: eval_step(run.model, run.loss, run.metrics, x)[0],
 )
 
+# The whole training objective and the optimizer update, at the initialization
+objective_grad = eqx.filter_jit(
+    eqx.filter_value_and_grad(lambda m, l, x_, d, k: l(m, x_, d, key=k)[0])
+)
+compare(
+    "training objective (fwd+bwd)",
+    lambda: objective_grad(run.model, run.loss, x, delta, key),
+)
+compare(
+    "  without dropout",
+    lambda: objective_grad(eqx.nn.inference_mode(run.model), run.loss, x, delta, key),
+)
+_, grads = objective_grad(run.model, run.loss, x, delta, key)
+opt_state = run.optim.init(trainable(run.model))
+update = eqx.filter_jit(lambda g, s, m: run.optim.update(g, s, trainable(m))[0])
+compare("optimizer update", lambda: update(grads, opt_state, run.model))
+
 # Full training steps from the same initialization
 train_step = make_train_step(run.optim)
 
@@ -110,10 +136,17 @@ def train():
             model, opt_state, run.loss, x_, delta_, step_key
         )
         losses.append(loss)
-    return trainable(model), losses
+    return losses, trainable(model)
 
 
-compare(f"{N_STEPS} training steps", train)
-trained = as_arrays(train())  # The parameters and losses
-fingerprint = hashlib.sha256(b"".join(a.tobytes() for a in trained)).hexdigest()[:16]
+outs = compare(f"{N_STEPS} training steps", train, N_TRAIN_REPEATS)
+losses = np.array([out[:N_STEPS] for out in outs])  # (n_repeats, n_steps)
+differs = np.any(losses != losses[0], axis=0)
+if differs.any():
+    step = int(np.argmax(differs))
+    print(
+        f"  The losses first differ at step {step}: "
+        + ", ".join(f"{v:.6f}" for v in losses[:, step])
+    )
+fingerprint = hashlib.sha256(b"".join(a.tobytes() for a in outs[0])).hexdigest()[:16]
 print(f"Fingerprint of {N_STEPS} training steps: {fingerprint}")
