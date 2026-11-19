@@ -21,8 +21,9 @@ after every epoch, and keeps the checkpoint with the lowest validation loss; `te
 evaluates a checkpoint on the test set, also in a separate process. Both log to
 Weights & Biases (see `wandb_logging.py`): the training loss and learning rate, the
 validation loss and metrics, and the audio and plots of the first
-`trainer.n_val_audio` validation items after every epoch; `test` adds the test loss
-and metrics to the summary of the run. The test audio is saved to `AUDIO_SAVE_DIR`.
+`trainer.n_val_audio` validation items after every epoch. The summary of the run has
+the validation values of the best checkpoint (`best/...`), to which `test` adds the
+test loss and metrics (`test/...`). The test audio is saved to `AUDIO_SAVE_DIR`.
 """
 
 import copy
@@ -46,7 +47,7 @@ from scipy.io import wavfile
 from tqdm import tqdm
 
 from src.experiments.util import import_class, instantiate
-from src.experiments.wandb_logging import start_run, val_example_media
+from src.experiments.wandb_logging import val_example_media, wandb_run
 from src.paths import AUDIO_SAVE_DIR, OUT_DIR
 
 logging.basicConfig()
@@ -310,10 +311,7 @@ def fit(config: dict[str, Any], seed: int) -> float:
     train_key = jax.random.fold_in(jax.random.key(seed), zlib.crc32(b"train"))
     n_batches_seen = 0
     best_val_loss = math.inf
-    with start_run(run.config, run.name, seed) as wb:
-        # The summary of the run shows the best (lowest) validation values
-        for name in ["loss", *run.metrics]:
-            wb.define_metric(f"val/{name}", summary="min")
+    with wandb_run(run.config, run.name, seed) as wb:
         for epoch in range(max_epochs):
             pbar = tqdm(
                 data.batches("train"),
@@ -363,6 +361,10 @@ def fit(config: dict[str, Any], seed: int) -> float:
                     "wandb_id": None if wb.disabled else wb.id,
                 }
                 save_ckpt(run.best_ckpt_path, model, opt_state, meta)
+                # The validation values of the best checkpoint (the one `test` uses
+                # by default), all from the same epoch
+                best = {f"best/val/{k}": v for k, v in val_values.items()}
+                wb.summary.update({"best/epoch": epoch, "best/step": step, **best})
 
     return best_val_loss
 
@@ -383,7 +385,7 @@ def test(config: dict[str, Any], seed: int, ckpt_path: str | None = None) -> flo
         f"seed {seed}: {format_metrics('test', test_values)} "
         f"(checkpoint {ckpt_path}.eqx from epoch {meta['epoch']})"
     )
-    with start_run(run.config, run.name, seed, resume_id=meta.get("wandb_id")) as wb:
+    with wandb_run(run.config, run.name, seed, resume_id=meta.get("wandb_id")) as wb:
         wb.summary.update({f"test/{k}": v for k, v in test_values.items()})
         wb.summary.update({"test/ckpt_epoch": meta["epoch"]})
     save_test_audio(outputs, run.name, seed, sr=run.data.sr, max_n=N_TEST_AUDIO)

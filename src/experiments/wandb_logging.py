@@ -11,11 +11,16 @@ have a step slider to go through the epochs.
 The mode is `custom.wandb_mode` in the config: `online` (the default, which needs
 `wandb login` once), `offline` (upload later with
 `wandb sync out/wandb_logs/wandb/offline-run-*`), or `disabled`. The `WANDB_MODE`
-environment variable takes precedence.
+environment variable takes precedence. The local files of an online run are deleted
+once it has finished and uploaded everything, so they do not pile up; those of an
+offline run, or of a run that failed, are kept.
 """
 
 import logging
 import os
+import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
@@ -31,13 +36,17 @@ log = logging.getLogger(__name__)
 log.setLevel(level=os.environ.get("LOGLEVEL", "INFO"))
 
 
-def start_run(
+@contextmanager
+def wandb_run(
     config: dict[str, Any], name: str, seed: int, resume_id: str | None = None
-) -> wandb.Run:
-    """Starts the wandb run of `name` and `seed`, or resumes the run `resume_id`."""
+) -> Iterator[wandb.Run]:
+    """Starts the wandb run of `name` and `seed`, or resumes the run `resume_id`, and
+    finishes it on exit (marking it as failed if there is an exception). Then, if the
+    run is online and succeeded, deletes its local directory: finishing the run
+    uploads everything first."""
     custom = config.get("custom") or {}
     os.makedirs(WANDB_LOGS_DIR, exist_ok=True)
-    return wandb.init(
+    run = wandb.init(
         project=custom.get("project_name", "venturi"),
         name=f"{name}__seed_{seed}",
         group=name,
@@ -47,6 +56,27 @@ def start_run(
         id=resume_id,
         resume="allow" if resume_id else None,
     )
+    is_online = not (run.offline or run.disabled)
+    local_dir = os.path.dirname(run.dir)  # e.g. wandb/run-<date>_<time>-<id>
+    with run:
+        yield run
+    if is_online:
+        delete_local_dir(local_dir, run.id)
+
+
+def delete_local_dir(local_dir: str, run_id: str) -> None:
+    """Deletes the local directory of a finished wandb run, after checking that it is
+    one (`<WANDB_LOGS_DIR>/wandb/run-<date>_<time>-<run_id>`)."""
+    local_dir = os.path.abspath(local_dir)
+    parent = os.path.join(os.path.abspath(WANDB_LOGS_DIR), "wandb")
+    name = os.path.basename(local_dir)
+    if os.path.dirname(local_dir) != parent or not (
+        name.startswith("run-") and name.endswith(f"-{run_id}")
+    ):
+        log.warning(f"Not deleting {local_dir}: not the directory of run {run_id}")
+        return
+    shutil.rmtree(local_dir, ignore_errors=True)
+    log.info(f"Deleted the local wandb files of run {run_id}: {local_dir}")
 
 
 def spectrogram_db(

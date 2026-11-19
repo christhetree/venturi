@@ -2,11 +2,11 @@
 Trains with the JAX trainer (`src/experiments/trainer_jax.py`). Run from the
 repository root, e.g.:
 
-    python scripts/train.py -c train_mss_log_micro_jax.yml
-    python scripts/train.py -c train_mss_log_micro_jax.yml --seeds 0 1 2
-    python scripts/train.py -c train_mss_log_micro_jax.yml \
+    python scripts/train.py -c train.yml
+    python scripts/train.py -c train.yml --seeds 0 1 2
+    python scripts/train.py -c train.yml \
         --set trainer.max_epochs=2 data.init_args.n_train=32
-    python scripts/train.py -c train_mss_log_micro_jax.yml --stages test
+    python scripts/train.py -c train.yml --stages test
 
 Without `--seeds`, a single run uses the config's `seed_everything`. With `--seeds`,
 like the PyTorch `scripts/train.py` for the 808 experiments, each seed also sets the

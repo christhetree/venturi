@@ -41,7 +41,8 @@ loss:
   class_path: src.experiments.losses_jax.DDSP808Loss
   init_args:
     synth: synth_jax.yml
-    loss_func: mss_meso_log_jax.yml  # or mss_revisited_jax.yml
+#    loss_func: mss_meso_log_jax.yml
+    loss_func: mss_revisited_jax.yml
     feature_type: cqt
     cqt_eps: 1e-3
 

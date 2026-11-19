@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(__file__, "../../")))
 from src.experiments.util import instantiate, load_config, setup_env  # noqa: E402
 from src.paths import CONFIGS_DIR  # noqa: E402
 
-config = load_config(os.path.join(CONFIGS_DIR, "train_mss_log_micro_jax.yml"))
+config = load_config(os.path.join(CONFIGS_DIR, "train.yml"))
 setup_env(config)
 
 import equinox as eqx  # noqa: E402
