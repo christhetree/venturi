@@ -5,7 +5,9 @@ custom:
   project_name: venturi  # The wandb project
   use_wandb_gpu: online   # wandb mode on GPU: online, offline, or disabled (or true / false)
   use_wandb_cpu: offline  # wandb mode on CPU, e.g. locally (the WANDB_MODE env var overrides both)
-  model_name: mss_rev_724k_adamw_1e-4t5
+  # model_name: mss_rev_724k_adamw_1e-4t5
+  model_name: mss_rev_724k_adamw_1e-4t5_alpha1.00
+  # model_name: mss_rev_724k_adamw_1e-4t5_tadam999
   dataset_name: mars_808_n681_b8_micro
   cpu_batch_size: 8
   is_deterministic: true
@@ -48,14 +50,17 @@ loss:
     # Multiplies the gradient of each synth parameter (the model's outputs) by
     # (curvature / geometric mean) ** -curvature_alpha, with the curvatures saved by
     # scripts/theta_curvature.py (path relative to the repository root)
-    use_curvature: false
-    curvature_path: data/curvatures/mss_rev_724k_adamw_1e-4t5__mars_808_n681_b8_micro__seed_420__init.json
-    curvature_alpha: 0.25
+    # use_curvature: false
+    use_curvature: true
+    curvature_path: data/curvatures/mss_rev_724k_adamw_1e-4t5__mars_808_n681_b32_iters100_micro__seed_420__init.json
+#    curvature_path: data/curvatures/mss_rev_724k_adamw_1e-4t5__mars_808_n681_b32_iters500_micro__seed_420__init.json
+    curvature_alpha: 1.00
     # Normalizes the gradient of each synth parameter during backpropagation like
     # Adam without momentum: divided by the square root of the bias-corrected running
     # mean (with decay grad_rms_b2) of its square, plus grad_rms_eps. Not together
     # with use_curvature
     use_grad_rms: false
+    # use_grad_rms: true
     grad_rms_b2: 0.999
     grad_rms_eps: 1e-8
 
