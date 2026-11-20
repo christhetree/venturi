@@ -12,13 +12,14 @@ import logging
 import math
 import os
 from collections.abc import Callable
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, NamedTuple, Optional, Sequence
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import korvax
 import numpy as np
+import optax
 from jaxtyping import Array, Complex, Float, Int, Key
 from korvax.loss import elementwise_loss
 
@@ -234,6 +235,36 @@ def _scale_grad_jvp(
     return x, x_dot * w.astype(x_dot.dtype)
 
 
+class GradRMSState(NamedTuple):
+    """The state of `normalize_grad_rms`, as in `optax.ScaleByAdamState`: the number
+    of updates, and `nu`, the running mean of the squared gradient of each synth
+    parameter."""
+
+    count: Int[Array, ""]
+    nu: Float[Array, "n_params"]
+
+
+def normalize_grad_rms(
+    g: Float[Array, "bs n_params"], state: GradRMSState, b2: float, eps: float
+) -> tuple[Float[Array, "bs n_params"], GradRMSState]:
+    """
+    Normalizes the gradients `g` of the synth parameters of a batch like
+    `optax.scale_by_adam(b1=0.0, b2=b2, eps=eps)`, i.e. Adam without momentum:
+    divides them by the square root of the bias-corrected running mean of their
+    squares, plus `eps`. The squared gradient of each parameter is its mean over the
+    batch, so this is identical to `optax.scale_by_adam` for a batch of one.
+
+    Adam's momentum (`b1`) does not apply: the gradients of each batch are those of
+    its own items, and can only go back through the model for those items.
+    """
+    count = optax.safe_increment(state.count)
+    # The same operations as `optax.scale_by_adam`
+    nu = (1 - b2) * jnp.mean(g**2, axis=0) + b2 * state.nu
+    nu_hat = nu / (1 - b2**count).astype(nu.dtype)
+    g = g / (jnp.sqrt(nu_hat) + eps)
+    return g, GradRMSState(count=count, nu=nu)
+
+
 def load_theta_curvatures(path: str, param_names: Sequence[str]) -> dict[str, Any]:
     """
     Loads the curvatures saved by `scripts/theta_curvature.py`, checking that they
@@ -268,7 +299,8 @@ class DDSP808Loss(eqx.Module):
     the loss compares the synthesized audio with the target.
 
     Holds only the fixed parts (synth, CQT, audio loss); the trainable model is passed
-    in on every call, so training state is just `(model, opt_state)`:
+    in on every call, so training state is just `(model, opt_state)` (plus the state
+    of `init_train_state` with `use_grad_rms`):
 
         loss = DDSP808Loss(synth, MultiResolutionSTFTLoss(...))
         (value, aux), grads = eqx.filter_value_and_grad(loss, has_aux=True)(
@@ -282,6 +314,13 @@ class DDSP808Loss(eqx.Module):
     has its own head in `Spectral2DCNN` and Adam normalizes the scale of each
     weight's updates, this mostly rebalances the gradients of the shared layers,
     which the parameters with the largest curvatures dominate otherwise.
+
+    With `use_grad_rms`, the gradient of the loss w.r.t. each predicted synth
+    parameter is instead normalized like Adam (without momentum) before it goes back
+    through the model: divided by the square root of the bias-corrected running mean
+    of its square (see `normalize_grad_rms`). The running mean is a state kept between
+    training steps, so training uses `value_and_grad` with the state of
+    `init_train_state` instead of differentiating `__call__`.
     """
 
     synth: DDSP808Synth
@@ -293,6 +332,9 @@ class DDSP808Loss(eqx.Module):
     curvature_alpha: float = eqx.field(static=True)
     # The multipliers of dL/dθ, None without `use_curvature`
     theta_grad_weights: Float[Array, "n_params"] | None
+    use_grad_rms: bool = eqx.field(static=True)
+    grad_rms_b2: float = eqx.field(static=True)
+    grad_rms_eps: float = eqx.field(static=True)
 
     def __init__(
         self,
@@ -303,6 +345,9 @@ class DDSP808Loss(eqx.Module):
         use_curvature: bool = False,
         curvature_path: str | None = None,
         curvature_alpha: float = 0.25,
+        use_grad_rms: bool = False,
+        grad_rms_b2: float = 0.999,
+        grad_rms_eps: float = 1e-8,
     ) -> None:
         """
         Args:
@@ -318,15 +363,30 @@ class DDSP808Loss(eqx.Module):
                 root. Only read with `use_curvature`.
             curvature_alpha: The exponent of the scaling. 0 leaves the gradients
                 unchanged, and 1 divides them by the (relative) curvatures.
+            use_grad_rms: Normalizes the gradient of each synth parameter like Adam
+                (see the class docstring). Not with `use_curvature`, whose constant
+                scaling it would cancel.
+            grad_rms_b2: The decay rate of the running mean of the squared gradients,
+                as Adam's `b2`.
+            grad_rms_eps: Added to the root mean square, as Adam's `eps`.
         """
         if feature_type != "cqt":
             raise NotImplementedError(f"Unsupported feature_type: {feature_type}")
+        if use_curvature and use_grad_rms:
+            raise ValueError("use_curvature and use_grad_rms cannot both be True")
+        if not 0 <= grad_rms_b2 < 1:
+            raise ValueError("grad_rms_b2 must be in [0, 1)")
+        if not (math.isfinite(grad_rms_eps) and grad_rms_eps >= 0):
+            raise ValueError("grad_rms_eps must be finite and nonnegative")
         self.synth = synth
         self.loss_func = loss_func
         self.cqt_eps = cqt_eps
         self.use_curvature = use_curvature
         self.curvature_path = curvature_path
         self.curvature_alpha = curvature_alpha
+        self.use_grad_rms = use_grad_rms
+        self.grad_rms_b2 = grad_rms_b2
+        self.grad_rms_eps = grad_rms_eps
         self.theta_grad_weights = None
         if use_curvature:
             if curvature_path is None:
@@ -387,6 +447,72 @@ class DDSP808Loss(eqx.Module):
             )
         return "\n".join(lines)
 
+    def describe_grad_rms(self) -> str:
+        """Describes the normalization of `use_grad_rms`, for the training log."""
+        assert self.use_grad_rms, "use_grad_rms is False"
+        return (
+            f"Normalizing the gradient of each synth parameter like Adam without "
+            f"momentum (b2 = {self.grad_rms_b2}, eps = {self.grad_rms_eps}), with "
+            f"the mean of its square over each batch"
+        )
+
+    def init_train_state(self) -> GradRMSState | None:
+        """The state kept between training steps: the running mean of the squared
+        gradients with `use_grad_rms`, else None."""
+        if not self.use_grad_rms:
+            return None
+        return GradRMSState(
+            count=jnp.zeros([], jnp.int32),
+            nu=jnp.zeros([self.synth.n_params], jnp.float32),
+        )
+
+    def predict(
+        self,
+        model: eqx.Module,
+        x: Float[Array, "bs 1 n_samples"],
+        *,
+        key: Key[Array, ""] | None = None,
+    ) -> tuple[Float[Array, "bs n_params"], Float[Array, "bs 1 n_samples"]]:
+        """Predicts the synth parameters of a batch of target audio, as in
+        `__call__`, and returns them with the delayed target."""
+        x = self.prepare_target(x)
+        U = jax.lax.stop_gradient(self.calc_U(x))
+        keys = None if key is None else jax.random.split(key, x.shape[0])
+        theta_hat = jax.vmap(model)(U, key=keys)
+        return theta_hat, x
+
+    def value_and_grad(
+        self,
+        model: eqx.Module,
+        x: Float[Array, "bs 1 n_samples"],
+        delta: Int[Array, "bs"] | None,
+        state: GradRMSState,
+        *,
+        key: Key[Array, ""] | None = None,
+    ) -> tuple[Float[Array, ""], eqx.Module, GradRMSState]:
+        """With `use_grad_rms`: the loss of `model` on a batch, as `__call__`, and
+        its gradient w.r.t. the floating arrays of `model`, as `eqx.filter_grad`, but
+        with the gradient of each synth parameter normalized by `normalize_grad_rms`
+        on its way back through the model.
+
+        Returns:
+            The loss, the gradient, and the updated state.
+        """
+        assert self.use_grad_rms, "use_grad_rms is False"
+        # Backpropagates in two parts, normalizing the gradients in between: from
+        # the loss to the synth parameters, then from them through the model
+        theta_hat, model_vjp, x = eqx.filter_vjp(
+            lambda m: self.predict(m, x, key=key), model, has_aux=True
+        )
+        value, g_theta = jax.value_and_grad(
+            lambda theta: self.loss_func(self.synth(theta, delta), x)
+        )(theta_hat)
+        g_theta, state = normalize_grad_rms(
+            g_theta, state, self.grad_rms_b2, self.grad_rms_eps
+        )
+        (grads,) = model_vjp(g_theta)
+        return value, grads, state
+
     def __call__(
         self,
         model: eqx.Module,
@@ -408,10 +534,7 @@ class DDSP808Loss(eqx.Module):
             The loss and a dict with the delayed target `x`, the synthesized `x_hat`,
             and the predicted parameters `theta_hat`.
         """
-        x = self.prepare_target(x)
-        U = jax.lax.stop_gradient(self.calc_U(x))
-        keys = None if key is None else jax.random.split(key, x.shape[0])
-        theta_hat = jax.vmap(model)(U, key=keys)
+        theta_hat, x = self.predict(model, x, key=key)
         if self.theta_grad_weights is not None:
             theta_hat = scale_grad(theta_hat, self.theta_grad_weights)
         x_hat = self.synth(theta_hat, delta)

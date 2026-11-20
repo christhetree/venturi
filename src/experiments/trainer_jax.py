@@ -14,7 +14,11 @@ A run is described by the same kind of config as the PyTorch runs (`class_path` 
 - `data`: a data module with `batches(stage)`, `n_batches(stage)`, and `sr`.
 
 The training state is `(model, opt_state)`; the loss is passed to the jitted steps
-as an argument.
+as an argument. A loss can also keep a state between training steps (e.g.
+`DDSP808Loss` with `use_grad_rms`): then its `init_train_state()` returns it
+(else None), and the training step calls
+`loss.value_and_grad(model, x, delta, state, key=key)`, which returns the loss,
+its gradient, and the updated state, instead of differentiating `loss`.
 
 For a config and a seed, `fit` trains with AdamW (or any optax optimizer), validates
 after every epoch, and keeps the checkpoint with the lowest validation loss; `test`
@@ -120,14 +124,19 @@ def make_train_step(optim: optax.GradientTransformation) -> Callable[..., Any]:
     compiled program as constants."""
 
     @eqx.filter_jit
-    def train_step(model, opt_state, loss, x, delta, key):
-        # Differentiates w.r.t. the first argument of `loss`, i.e. the model
-        (value, _), grads = eqx.filter_value_and_grad(loss, has_aux=True)(
-            model, x, delta, key=key
-        )
+    def train_step(model, opt_state, loss, x, delta, key, loss_state=None):
+        if loss_state is None:
+            # Differentiates w.r.t. the first argument of `loss`, i.e. the model
+            (value, _), grads = eqx.filter_value_and_grad(loss, has_aux=True)(
+                model, x, delta, key=key
+            )
+        else:  # See the module docstring
+            value, grads, loss_state = loss.value_and_grad(
+                model, x, delta, loss_state, key=key
+            )
         updates, opt_state = optim.update(grads, opt_state, trainable(model))
         model = eqx.apply_updates(model, updates)
-        return model, opt_state, value
+        return model, opt_state, loss_state, value
 
     return train_step
 
@@ -387,7 +396,12 @@ def fit(config: dict[str, Any], seed: int) -> float:
     log.info(f"Trainable parameters: {n_params:,}")
     if getattr(loss, "use_curvature", False):  # E.g. in `DDSP808Loss`
         log.info(loss.describe_curvature_scaling())
+    if getattr(loss, "use_grad_rms", False):  # E.g. in `DDSP808Loss`
+        log.info(loss.describe_grad_rms())
     opt_state = run.optim.init(trainable(model))
+    # E.g. the running mean of `DDSP808Loss` with `use_grad_rms`
+    init_loss_state = getattr(loss, "init_train_state", None)
+    loss_state = None if init_loss_state is None else init_loss_state()
     train_step = make_train_step(run.optim)
 
     train_key = jax.random.fold_in(jax.random.key(seed), zlib.crc32(b"train"))
@@ -403,8 +417,8 @@ def fit(config: dict[str, Any], seed: int) -> float:
             pending = []  # Device arrays of the training steps not logged yet
             for x, _, delta in pbar:
                 step_key = jax.random.fold_in(train_key, n_batches_seen)
-                model, opt_state, train_loss = train_step(
-                    model, opt_state, loss, x, delta, step_key
+                model, opt_state, loss_state, train_loss = train_step(
+                    model, opt_state, loss, x, delta, step_key, loss_state
                 )
                 n_batches_seen += 1
                 pending.append((n_batches_seen, train_loss, current_lr(opt_state)))

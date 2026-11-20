@@ -51,6 +51,13 @@ loss:
     use_curvature: false
     curvature_path: data/curvatures/mss_rev_724k_adamw_1e-4t5__mars_808_n681_b8_micro__seed_420__init.json
     curvature_alpha: 0.25
+    # Normalizes the gradient of each synth parameter during backpropagation like
+    # Adam without momentum: divided by the square root of the bias-corrected running
+    # mean (with decay grad_rms_b2) of its square, plus grad_rms_eps. Not together
+    # with use_curvature
+    use_grad_rms: false
+    grad_rms_b2: 0.999
+    grad_rms_eps: 1e-8
 
 # Computed on the validation and test sets (on the synthesized audio vs. the target)
 # whatever the training loss above, and logged as val/<name> and test/<name>

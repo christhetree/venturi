@@ -196,11 +196,12 @@ train_step = make_train_step(run.optim)
 
 def train():
     model, opt_state = run.model, run.optim.init(trainable(run.model))
+    loss_state = run.loss.init_train_state()
     losses = []
     for i, (x_, _, delta_) in enumerate(batches):
         step_key = jax.random.fold_in(key, i)
-        model, opt_state, loss = train_step(
-            model, opt_state, run.loss, x_, delta_, step_key
+        model, opt_state, loss_state, loss = train_step(
+            model, opt_state, run.loss, x_, delta_, step_key, loss_state
         )
         losses.append(loss)
     return losses, trainable(model)

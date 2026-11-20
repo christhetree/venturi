@@ -65,9 +65,9 @@ SEEDS = None  # e.g. [0, 1, 2]; None for the config's `seed_everything`
 CKPT = None  # None for the initialization, "best" for the best checkpoint of `fit`,
 # or the path of a checkpoint
 N_BATCHES = 1  # Training batches the curvature-vector products are summed over
-N_ITER = 20  # Max power iteration steps per synth parameter
+N_ITER = 100  # Max power iteration steps per synth parameter
 TOL = 0.01  # Stops power iteration once its relative residual is below; 0.0: never
-VMAP_THETA = False  # All synth parameters in parallel: faster, but 14x the memory
+VMAP_THETA = True  # All synth parameters in parallel: faster, but 14x the memory
 OVERRIDES = []  # e.g. ["custom.cpu_batch_size=2"]
 
 
@@ -295,7 +295,6 @@ if __name__ == "__main__":
     seeds = args.seeds
     if seeds is None:
         seeds = [config.get("seed_everything", 0)]
-    os.makedirs(args.out_dir, exist_ok=True)
     for seed in seeds:
         if args.seeds is not None:
             # Like `scripts/train.py`: each seed also sets the data split
@@ -326,6 +325,7 @@ if __name__ == "__main__":
         out_path = os.path.join(
             args.out_dir, f"{results['run_name']}__seed_{seed}__{tag}.json"
         )
+        os.makedirs(args.out_dir, exist_ok=True)
         with open(out_path, "w") as f:
             json.dump(results, f, indent=2)
         log.info(
