@@ -7,20 +7,24 @@ Also `DDSP808Loss`, the training objective of the 808 experiments, which uses on
 these losses on the synthesized audio.
 """
 
+import json
 import logging
+import math
 import os
 from collections.abc import Callable
-from typing import List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import korvax
+import numpy as np
 from jaxtyping import Array, Complex, Float, Int, Key
 from korvax.loss import elementwise_loss
 
 from src.experiments.cqt_jax import CQT, calc_cqt
 from src.experiments.synths_jax import DDSP808Synth
+from src.paths import ROOT_DIR
 from src.scrapl_jax import safe_lp_norm
 
 logging.basicConfig()
@@ -205,6 +209,58 @@ class LogMSSLoss:
         return dist
 
 
+@jax.custom_jvp
+def scale_grad(x: Float[Array, "... n"], w: Float[Array, "n"]) -> Float[Array, "... n"]:
+    """
+    Returns `x` unchanged, but multiplies its derivatives by `w` (over its last axis),
+    like the PyTorch gradient hook `x.register_hook(lambda g: g * w)`. `w` gets no
+    derivatives.
+
+    Defined by its JVP (whose transpose scales the gradients) rather than its VJP,
+    so that it also works with forward-mode autodiff, e.g. the forward-over-reverse
+    curvature-vector products of `src.scrapl_jax.warmup`. Second derivatives are
+    those of the scaled gradient (with the forward pass unchanged), so `w` appears in
+    them once.
+    """
+    return x
+
+
+@scale_grad.defjvp
+def _scale_grad_jvp(
+    primals: tuple[Array, Array], tangents: tuple[Array, Array]
+) -> tuple[Array, Array]:
+    x, w = primals
+    x_dot, _ = tangents
+    return x, x_dot * w.astype(x_dot.dtype)
+
+
+def load_theta_curvatures(path: str, param_names: Sequence[str]) -> dict[str, Any]:
+    """
+    Loads the curvatures saved by `scripts/theta_curvature.py`, checking that they
+    are finite and positive for exactly the synth parameters `param_names`.
+
+    Args:
+        path: The JSON file, absolute or relative to the repository root.
+        param_names: The names of the synth parameters.
+
+    Returns:
+        The saved results, whose `params` maps each parameter name to its
+        `curvature` and `relative_residual`.
+    """
+    with open(os.path.join(ROOT_DIR, path)) as f:
+        results = json.load(f)
+    params = results["params"]
+    if set(params) != set(param_names):
+        raise ValueError(
+            f"{path} has the curvatures of {sorted(params)}, but the synth "
+            f"parameters are {sorted(param_names)}"
+        )
+    curvatures = np.array([params[name]["curvature"] for name in param_names])
+    if not (np.isfinite(curvatures).all() and (curvatures > 0).all()):
+        raise ValueError(f"The curvatures in {path} must be finite and positive")
+    return results
+
+
 class DDSP808Loss(eqx.Module):
     """
     The training objective of `DDSP808LightingModule` (`lightning.py`) in JAX: the CQT
@@ -218,12 +274,25 @@ class DDSP808Loss(eqx.Module):
         (value, aux), grads = eqx.filter_value_and_grad(loss, has_aux=True)(
             model, x, delta, key=key
         )
+
+    With `use_curvature`, the gradient of the loss w.r.t. each predicted synth
+    parameter θ_i is multiplied by `(c_i / geometric mean of c) ** -curvature_alpha`
+    before it reaches the model, where `c_i` is its curvature from
+    `scripts/theta_curvature.py`. The loss values are unchanged. Since each parameter
+    has its own head in `Spectral2DCNN` and Adam normalizes the scale of each
+    weight's updates, this mostly rebalances the gradients of the shared layers,
+    which the parameters with the largest curvatures dominate otherwise.
     """
 
     synth: DDSP808Synth
     cqt: CQT
     loss_func: Callable[..., Float[Array, ""]]
     cqt_eps: float = eqx.field(static=True)
+    use_curvature: bool = eqx.field(static=True)
+    curvature_path: str | None = eqx.field(static=True)
+    curvature_alpha: float = eqx.field(static=True)
+    # The multipliers of dL/dθ, None without `use_curvature`
+    theta_grad_weights: Float[Array, "n_params"] | None
 
     def __init__(
         self,
@@ -231,6 +300,9 @@ class DDSP808Loss(eqx.Module):
         loss_func: Callable[..., Float[Array, ""]],
         feature_type: str = "cqt",
         cqt_eps: float = 1e-3,
+        use_curvature: bool = False,
+        curvature_path: str | None = None,
+        curvature_alpha: float = 0.25,
     ) -> None:
         """
         Args:
@@ -239,12 +311,32 @@ class DDSP808Loss(eqx.Module):
                 (e.g. `MultiResolutionSTFTLoss` or `LogMSSLoss`).
             feature_type: Only "cqt" is supported, as in `lightning.py`.
             cqt_eps: Scale of the log compression of the CQT.
+            use_curvature: Scales the gradient of each synth parameter according to
+                its curvature (see the class docstring).
+            curvature_path: The JSON file of the curvatures, saved by
+                `scripts/theta_curvature.py`, absolute or relative to the repository
+                root. Only read with `use_curvature`.
+            curvature_alpha: The exponent of the scaling. 0 leaves the gradients
+                unchanged, and 1 divides them by the (relative) curvatures.
         """
         if feature_type != "cqt":
             raise NotImplementedError(f"Unsupported feature_type: {feature_type}")
         self.synth = synth
         self.loss_func = loss_func
         self.cqt_eps = cqt_eps
+        self.use_curvature = use_curvature
+        self.curvature_path = curvature_path
+        self.curvature_alpha = curvature_alpha
+        self.theta_grad_weights = None
+        if use_curvature:
+            if curvature_path is None:
+                raise ValueError("use_curvature needs a curvature_path")
+            if not (math.isfinite(curvature_alpha) and curvature_alpha >= 0):
+                raise ValueError("curvature_alpha must be finite and nonnegative")
+            params = load_theta_curvatures(curvature_path, synth.param_names)["params"]
+            log_c = np.log([params[name]["curvature"] for name in synth.param_names])
+            weights = np.exp(-curvature_alpha * (log_c - log_c.mean()))
+            self.theta_grad_weights = jnp.asarray(weights, dtype=jnp.float32)
         # Same CQT settings as `DDSP808LightingModule`
         self.cqt = CQT(
             sr=synth.sr,
@@ -268,6 +360,32 @@ class DDSP808Loss(eqx.Module):
         self, x: Float[Array, "bs 1 n_samples"]
     ) -> Float[Array, "bs n_bins n_frames"]:
         return jax.vmap(lambda x_: calc_cqt(x_, self.cqt, self.cqt_eps))(x[:, 0, :])
+
+    def describe_curvature_scaling(self) -> str:
+        """Describes the gradient scaling of `use_curvature`, for the training log."""
+        assert self.use_curvature, "use_curvature is False"
+        results = load_theta_curvatures(self.curvature_path, self.synth.param_names)
+        if results.get("ckpt") is None:
+            model_state = "the model's initialization"
+        else:
+            model_state = f"{results['ckpt']} (epoch {results.get('ckpt_epoch')})"
+        lines = [
+            f"Scaling the gradient of each synth parameter by (curvature / geometric "
+            f"mean) ** -{self.curvature_alpha}, with the curvatures of "
+            f"{self.curvature_path} ({results.get('loss_func')}, "
+            f"{results.get('n_batches')} batch(es) of {results.get('batch_size')}, "
+            f"seed {results.get('seed')}, {model_state}):"
+        ]
+        tol = results.get("tol") or 0.0
+        weights = np.asarray(self.theta_grad_weights)
+        for name, weight in zip(self.synth.param_names, weights):
+            p = results["params"][name]
+            not_converged = 0 < tol <= p["relative_residual"]
+            lines.append(
+                f"    {name:<12} curvature {p['curvature']:.3e}, weight {weight:.3f}"
+                f"{' (not converged)' * not_converged}"
+            )
+        return "\n".join(lines)
 
     def __call__(
         self,
@@ -294,6 +412,8 @@ class DDSP808Loss(eqx.Module):
         U = jax.lax.stop_gradient(self.calc_U(x))
         keys = None if key is None else jax.random.split(key, x.shape[0])
         theta_hat = jax.vmap(model)(U, key=keys)
+        if self.theta_grad_weights is not None:
+            theta_hat = scale_grad(theta_hat, self.theta_grad_weights)
         x_hat = self.synth(theta_hat, delta)
         loss = self.loss_func(x_hat, x)
         return loss, {"x": x, "x_hat": x_hat, "theta_hat": theta_hat}

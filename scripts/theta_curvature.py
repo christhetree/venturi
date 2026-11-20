@@ -7,6 +7,8 @@ Computes the curvature of the training loss for each synth parameter (the 14
     python scripts/theta_curvature.py -c train.yml
     python scripts/theta_curvature.py -c train.yml --seeds 0 1 2
     python scripts/theta_curvature.py -c train.yml --ckpt best
+    python scripts/theta_curvature.py -c train.yml --ckpt best \
+        --set custom.run_timestamp=2026_01_31_12_00_00
     python scripts/theta_curvature.py -c train.yml --n_batches 8 --n_iter 50 --tol 0
 
 The data, model, synth, and loss are built from the config like `scripts/train.py`
@@ -19,7 +21,9 @@ inference mode (no dropout), since the warmup needs a deterministic encoder.
 
 By default, the curvature is computed at the model's initialization (like the
 theta-IS warmup, which runs before training); `--ckpt` uses a checkpoint saved by
-`fit` instead. The results are printed and saved as JSON to `out/theta_curvature/`.
+`fit` instead: `best` is that of the latest run with the same name and seed, or of
+the run of `custom.run_timestamp` if it is set. The results are printed and saved as
+JSON to `out/theta_curvature/`.
 
 Without arguments (e.g. when run from an IDE), the defaults are the constants below,
 which can be edited.
@@ -29,6 +33,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 import zlib
@@ -83,7 +88,8 @@ def calc_theta_curvature(
         config: A training config, as loaded by `scripts/train.py`.
         seed: The run seed (model initialization, batch order, and power iteration).
         ckpt: None for the model's initialization, "best" for the best checkpoint of
-            `fit` for this config and seed, or the path of a checkpoint.
+            `fit` for this config and seed (see `find_best_ckpt_path`), or the path
+            of a checkpoint.
         n_batches: Training batches the curvature-vector products are summed over.
         n_iter: Max power iteration steps per synth parameter.
         tol: Stops power iteration once its relative residual is below `tol`.
@@ -99,24 +105,24 @@ def calc_theta_curvature(
     import jax.numpy as jnp
     import numpy as np
 
-    from src.experiments.trainer_jax import load_ckpt, setup, trainable
+    from src.experiments.trainer_jax import (
+        find_best_ckpt_path,
+        load_ckpt,
+        setup,
+        trainable,
+    )
     from src.scrapl_jax.warmup import warmup_lc_hvp
 
     run = setup(config, seed)
     model, loss, data = run.model, run.loss, run.data
     ckpt_path, ckpt_epoch = None, None
     if ckpt is not None:
-        ckpt_path = run.best_ckpt_path if ckpt == "best" else ckpt
+        ckpt_path = find_best_ckpt_path(run) if ckpt == "best" else ckpt
         ckpt_path = ckpt_path.removesuffix(".eqx")
         opt_state_like = run.optim.init(trainable(model))
         model, _, meta = load_ckpt(ckpt_path, model, opt_state_like)
         ckpt_epoch = meta["epoch"]
         log.info(f"Loaded checkpoint {ckpt_path}.eqx from epoch {ckpt_epoch}")
-    # Created by `setup`, unused here
-    for d in [run.dir, os.path.dirname(run.dir)]:
-        if os.path.isdir(d) and not os.listdir(d):
-            os.rmdir(d)
-
     synth = loss.synth
     param_names = synth.param_names
     assert model.n_params == len(param_names), (
@@ -167,10 +173,14 @@ def calc_theta_curvature(
     max_n_products = len(param_names) * n_iter * n_batches
     n_products_per_call = len(param_names) if vmap_theta else 1
     pbar = None
+    compile_start = None
 
     def on_product() -> None:
         nonlocal pbar
-        if pbar is None:  # Created after compiling, when the first product is done
+        if pbar is None:  # The first product, so compiling is done
+            # Logged without breaking the warmup's progress bar
+            with tqdm.external_write_mode():
+                log.info(f"Compiled in {time.perf_counter() - compile_start:.1f} s")
             pbar = tqdm(
                 total=max_n_products,
                 desc="Curvature-vector products (fewer if converged early)",
@@ -179,6 +189,12 @@ def calc_theta_curvature(
         pbar.update(n_products_per_call)
 
     def loss_fn(x_hat: jax.Array, x: jax.Array) -> jax.Array:
+        nonlocal compile_start
+        # This Python code only runs when the warmup's compiled function is traced
+        if compile_start is None:
+            compile_start = time.perf_counter()
+            with tqdm.external_write_mode():
+                log.info("Compiling the curvature-vector products")
         # Without arguments, so that it is not unrolled over theta by `vmap_theta`
         jax.debug.callback(on_product)
         return loss.loss_func(x_hat, x)
@@ -299,6 +315,14 @@ if __name__ == "__main__":
         else:
             ckpt_name = os.path.basename(results["ckpt"]).removesuffix(".eqx")
             tag = f"{ckpt_name}_epoch_{results['ckpt_epoch']}"
+            # The date and time of the checkpoint's run folder, if it has them, so
+            # that the results of runs with the same name do not overwrite each other
+            run_folder = os.path.basename(
+                os.path.dirname(os.path.dirname(results["ckpt"]))
+            )
+            timestamp = run_folder.split("__")[0]
+            if re.fullmatch(r"\d{4}(_\d{2}){5}", timestamp):
+                tag = f"{timestamp}__{tag}"
         out_path = os.path.join(
             args.out_dir, f"{results['run_name']}__seed_{seed}__{tag}.json"
         )

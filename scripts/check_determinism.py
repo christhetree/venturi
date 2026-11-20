@@ -75,9 +75,6 @@ print(f"XLA_FLAGS: {os.environ.get('XLA_FLAGS', '')}")
 print(f"JAX compilation cache: {jax.config.jax_compilation_cache_dir}")
 
 run = setup(config, seed=config.get("seed_everything", 0))
-for d in [run.dir, os.path.dirname(run.dir)]:  # Created by `setup`, unused here
-    if os.path.isdir(d) and not os.listdir(d):
-        os.rmdir(d)
 batches = [b for _, b in zip(range(N_STEPS), run.data.batches("train"))]
 x, _, delta = batches[0]
 key = jax.random.key(0)

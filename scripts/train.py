@@ -15,6 +15,14 @@ data `shuffle_seed`, so every seed uses a different train / val / test split.
 `--stages` runs `fit` (training) and / or `test` (of the best checkpoint of a
 previous `fit` with the same config and seed); both by default.
 
+`fit` saves to `out/jax_logs/<YYYY_MM_DD_HH_MM_SS>__<run name>/seed_<seed>`, with
+the date and time this script started (`custom.run_timestamp`), so runs with the same
+name do not overwrite each other. `test` uses the checkpoint of the `fit` of the same
+call, or else of the latest run with the same name and seed. To test an earlier run:
+
+    python scripts/train.py -c train.yml --stages test \
+        --set custom.run_timestamp=2026_01_31_12_00_00
+
 Without arguments (e.g. when run from an IDE), the defaults are the constants below
 (`CONFIG`, `SEEDS`, `STAGES`, and `OVERRIDES`), which can be edited.
 """
@@ -74,7 +82,12 @@ if __name__ == "__main__":
     setup_env(config)
 
     # Imports JAX, so only after `setup_env`
-    from src.experiments.trainer_jax import fit, test
+    from src.experiments.trainer_jax import fit, new_run_timestamp, test
+
+    config["custom"] = config.get("custom") or {}
+    if "fit" in args.stages and not config["custom"].get("run_timestamp"):
+        # The same run folder date and time for every seed and stage of this call
+        config["custom"]["run_timestamp"] = new_run_timestamp()
 
     log.info(f"Running {' and '.join(args.stages)} with config: {config_path}")
     seeds = args.seeds

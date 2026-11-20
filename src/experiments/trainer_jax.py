@@ -18,7 +18,11 @@ as an argument.
 
 For a config and a seed, `fit` trains with AdamW (or any optax optimizer), validates
 after every epoch, and keeps the checkpoint with the lowest validation loss; `test`
-evaluates a checkpoint on the test set, also in a separate process. Both log to
+evaluates a checkpoint on the test set, also in a separate process. `fit` saves the
+resolved config and the checkpoint to
+`JAX_LOGS_DIR/<YYYY_MM_DD_HH_MM_SS>__<name>/seed_<seed>`, where the date and time
+(`custom.run_timestamp`, the current ones by default) keep runs with the same name
+from overwriting each other; see `setup` and `find_best_ckpt_path`. Both log to
 Weights & Biases (see `wandb_logging.py`): the training loss and learning rate, the
 validation loss and metrics, and the audio and plots of the first
 `trainer.n_val_audio` validation items after every epoch. The summary of the run has
@@ -32,9 +36,11 @@ import json
 import logging
 import math
 import os
+import re
 import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import equinox as eqx
@@ -55,6 +61,7 @@ log = logging.getLogger(__name__)
 log.setLevel(level=os.environ.get("LOGLEVEL", "INFO"))
 
 JAX_LOGS_DIR = os.path.join(OUT_DIR, "jax_logs")
+RUN_TIMESTAMP_FORMAT = "%Y_%m_%d_%H_%M_%S"  # At the start of the run folders
 N_TEST_AUDIO = 128  # Test items saved as audio, as in `DDSP808LightingModule`
 
 
@@ -237,26 +244,56 @@ class Run:
     """What `fit` and `test` build from a config and a seed."""
 
     name: str
-    dir: str  # The resolved config and checkpoints
+    dir: str  # The resolved config and checkpoints, created by `fit`
     seed: int
-    config: dict[str, Any]  # With the CPU settings and the data seed applied
+    config: dict[str, Any]  # With the CPU settings, data seed, and timestamp applied
     data: Any
     model: eqx.Module  # Freshly initialized
     loss: Callable[..., Any]
     metrics: dict[str, Callable[..., Any]]
     optim: optax.GradientTransformation
     accumulate: int
+    # Whether the date and time in `dir` are the current ones, rather than those of
+    # `custom.run_timestamp`
+    is_new_timestamp: bool
 
     @property
     def best_ckpt_path(self) -> str:
         return os.path.join(self.dir, "best")
 
 
+def new_run_timestamp() -> str:
+    """The current date and time, as at the start of the run folders."""
+    return datetime.now().strftime(RUN_TIMESTAMP_FORMAT)
+
+
+def parse_run_timestamp(value: str | int) -> str:
+    """Checks a `custom.run_timestamp`, which YAML reads as an integer when it is
+    not quoted (e.g. 2026_01_31_12_00_00 as 20260131120000, since underscores are
+    digit separators in YAML 1.1), and returns it as YYYY_MM_DD_HH_MM_SS."""
+    timestamp = str(value)
+    if re.fullmatch(r"\d{14}", timestamp):
+        parts = [timestamp[:4]] + [timestamp[i : i + 2] for i in range(4, 14, 2)]
+        timestamp = "_".join(parts)
+    try:
+        datetime.strptime(timestamp, RUN_TIMESTAMP_FORMAT)
+    except ValueError:
+        raise ValueError(
+            f"custom.run_timestamp must be YYYY_MM_DD_HH_MM_SS, not {value!r}"
+        ) from None
+    return timestamp
+
+
 def setup(config: dict[str, Any], seed: int) -> Run:
     """Builds the data, model, loss, and optimizer of a run. Everything is derived
-    from the config and the seed, so `fit` and `test` build identical runs."""
+    from the config and the seed, so `fit` and `test` build identical runs.
+
+    The run's folder starts with `custom.run_timestamp`, or the current date and time
+    if it is not set. `scripts/train.py` sets it once, so that the seeds and stages
+    of one call share it, and `test` finds the checkpoint saved by `fit`."""
     config = copy.deepcopy(config)
     custom = config.get("custom") or {}
+    config["custom"] = custom
     trainer_cfg = config.get("trainer") or {}
     accumulate = trainer_cfg.get("accumulate_grad_batches", 1)
     name = custom.get("run_name") or (
@@ -270,8 +307,14 @@ def setup(config: dict[str, Any], seed: int) -> Run:
         data_args["batch_size"] = custom["cpu_batch_size"]
     data_args["seed"] = seed
 
-    run_dir = os.path.join(JAX_LOGS_DIR, name, f"seed_{seed}")
-    os.makedirs(run_dir, exist_ok=True)
+    is_new_timestamp = not custom.get("run_timestamp")
+    if is_new_timestamp:
+        custom["run_timestamp"] = new_run_timestamp()
+    else:
+        custom["run_timestamp"] = parse_run_timestamp(custom["run_timestamp"])
+    run_dir = os.path.join(
+        JAX_LOGS_DIR, f"{custom['run_timestamp']}__{name}", f"seed_{seed}"
+    )
     log.info(f"Run {name}, seed {seed}, backend {jax.default_backend()}: {run_dir}")
 
     key = jax.random.key(seed)
@@ -284,7 +327,43 @@ def setup(config: dict[str, Any], seed: int) -> Run:
         config["optimizer"], config.get("lr_scheduler"), steps_per_epoch, accumulate
     )
     return Run(
-        name, run_dir, seed, config, data, model, loss, metrics, optim, accumulate
+        name,
+        run_dir,
+        seed,
+        config,
+        data,
+        model,
+        loss,
+        metrics,
+        optim,
+        accumulate,
+        is_new_timestamp,
+    )
+
+
+def find_best_ckpt_path(run: Run) -> str:
+    """The path (without `.eqx`) of the best checkpoint saved by `fit` for the config
+    and seed of `run`: in the folder of `run` if `custom.run_timestamp` is set (e.g.
+    by `scripts/train.py` before `fit`), else in the latest folder with the same
+    run name and seed that has one."""
+    if not run.is_new_timestamp:
+        return run.best_ckpt_path
+    # The run folders with the same name, oldest first: the one from before the
+    # folders started with the date and time, then the others by date and time
+    pattern = re.compile(r"\d{4}(_\d{2}){5}__" + re.escape(run.name))
+    run_dirs = [run.name]
+    if os.path.isdir(JAX_LOGS_DIR):
+        run_dirs += sorted(d for d in os.listdir(JAX_LOGS_DIR) if pattern.fullmatch(d))
+    for run_dir in reversed(run_dirs):
+        path = os.path.join(JAX_LOGS_DIR, run_dir, f"seed_{run.seed}", "best")
+        if os.path.isfile(f"{path}.eqx"):
+            log.info(
+                f"Using the latest checkpoint of {run.name}, seed {run.seed}: "
+                f"{path}.eqx"
+            )
+            return path
+    raise FileNotFoundError(
+        f"No checkpoint of {run.name}, seed {run.seed} in {JAX_LOGS_DIR}"
     )
 
 
@@ -299,12 +378,15 @@ def fit(config: dict[str, Any], seed: int) -> float:
     log_every_n_steps = trainer_cfg.get("log_every_n_steps", 50)
     # Validation items logged as audio and plots after every epoch
     n_val_audio = trainer_cfg.get("n_val_audio", 5)
+    os.makedirs(run.dir, exist_ok=True)
     with open(os.path.join(run.dir, "config.yml"), "w") as f:
         yaml.safe_dump(run.config, f, sort_keys=False)
 
     model, loss, data, accumulate = run.model, run.loss, run.data, run.accumulate
     n_params = sum(p.size for p in jax.tree.leaves(trainable(model)))
     log.info(f"Trainable parameters: {n_params:,}")
+    if getattr(loss, "use_curvature", False):  # E.g. in `DDSP808Loss`
+        log.info(loss.describe_curvature_scaling())
     opt_state = run.optim.init(trainable(model))
     train_step = make_train_step(run.optim)
 
@@ -371,11 +453,11 @@ def fit(config: dict[str, Any], seed: int) -> float:
 
 def test(config: dict[str, Any], seed: int, ckpt_path: str | None = None) -> float:
     """Tests a checkpoint, by default the best one that `fit` saved for this config
-    and seed: adds the test loss and metrics to the summary of its wandb run (resumed
-    from the checkpoint's metadata) and saves the test audio. Can run in a different
-    process from `fit`. Returns the test loss."""
+    and seed (see `find_best_ckpt_path`): adds the test loss and metrics to the
+    summary of its wandb run (resumed from the checkpoint's metadata) and saves the
+    test audio. Can run in a different process from `fit`. Returns the test loss."""
     run = setup(config, seed)
-    ckpt_path = (ckpt_path or run.best_ckpt_path).removesuffix(".eqx")
+    ckpt_path = (ckpt_path or find_best_ckpt_path(run)).removesuffix(".eqx")
     opt_state_like = run.optim.init(trainable(run.model))
     model, _, meta = load_ckpt(ckpt_path, run.model, opt_state_like)
     test_values, outputs = evaluate(

@@ -45,6 +45,12 @@ loss:
     loss_func: mss_revisited_jax.yml
     feature_type: cqt
     cqt_eps: 1e-3
+    # Multiplies the gradient of each synth parameter (the model's outputs) by
+    # (curvature / geometric mean) ** -curvature_alpha, with the curvatures saved by
+    # scripts/theta_curvature.py (path relative to the repository root)
+    use_curvature: false
+    curvature_path: data/curvatures/mss_rev_724k_adamw_1e-4t5__mars_808_n681_b8_micro__seed_420__init.json
+    curvature_alpha: 0.25
 
 # Computed on the validation and test sets (on the synthesized audio vs. the target)
 # whatever the training loss above, and logged as val/<name> and test/<name>
